@@ -35,6 +35,7 @@ const productSchema = new mongoose.Schema({
   category: { type: String, required: true },
   price: { type: Number, required: true },
   originalPrice: Number,
+  inputCurrency: { type: String, default: 'USD' },
   rating: { type: Number, default: 0 },
   reviews: { type: Number, default: 0 },
   isSample: { type: Boolean, default: false },

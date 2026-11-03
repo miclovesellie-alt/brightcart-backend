@@ -32,6 +32,8 @@ Public catalog requests hide drafts, out-of-stock products, supplier details, an
 
 Admin product records accept `images` as an ordered array of public image URLs; the first URL is also stored in the legacy `image` field for existing clients. Categories are free-form strings, so admins can create categories without a backend migration. Supplier unit cost and inbound shipping per unit are stored in `cost` and `supplierDetails.unitCost` / `supplierDetails.shippingCost`; the storefront API removes these internal costs from public product responses.
 
+Catalog prices are stored in USD for consistent orders and payments. Product entry may record an `inputCurrency` for the admin's reference; the frontend converts entered prices and supplier costs to USD before saving, then formats USD values in each shopper's preferred currency.
+
 ## Dropshipping workspace
 
 The `/api/dropship` routes back the integrated admin research, pricing, product studio, fulfillment, and connection views. Research candidates are entered with source links and facts; the score uses only those entered costs, stock, and shipping estimates, and explicitly reports missing trend, demand, competition, and supplier-history signals. Import creates a hidden catalog draft; publishing requires stock, source and cost details, and explicit policy and inventory review.
