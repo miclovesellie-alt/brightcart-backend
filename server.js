@@ -514,13 +514,48 @@ async function createOrder(req, res) {
       );
       const qty = Number(incoming.qty || 1);
       if (!product || !Number.isInteger(qty) || qty < 1 || qty > 99) return res.status(400).json({ success: false, error: 'A product is unavailable or has an invalid quantity. Refresh the cart and try again.' });
-      const { cost, supplier, supplierDetails, verifiedFacts, policyReviewed, inventoryVerified, ...safeProduct } = product.toObject ? product.toObject() : product;
+      const storedProduct = product.toObject ? product.toObject() : product;
+      const requestedVariant = incoming.variant && typeof incoming.variant === 'object' ? incoming.variant : null;
+      let chosenVariant = null;
+      if (requestedVariant) {
+        const variantKey = String(requestedVariant.id || requestedVariant.color || requestedVariant.name || '').trim().toLowerCase();
+        const variants = Array.isArray(storedProduct.variants) ? storedProduct.variants : [];
+        chosenVariant = variants.find(variant =>
+          String(variant?.id || variant?.color || variant?.name || '').trim().toLowerCase() === variantKey
+          || (variant?.color && String(variant.color).trim().toLowerCase() === variantKey)
+          || (variant?.name && String(variant.name).trim().toLowerCase() === variantKey)
+        );
+        if (!chosenVariant) return res.status(400).json({ success: false, error: 'The selected product color is no longer available. Refresh the product and try again.' });
+        if (chosenVariant.stock != null && Number.isInteger(Number(chosenVariant.stock)) && Number(chosenVariant.stock) >= 0 && qty > Number(chosenVariant.stock)) {
+          return res.status(409).json({ success: false, error: 'The selected color does not have enough stock.' });
+        }
+      }
+      const { cost, supplier, supplierDetails, verifiedFacts, policyReviewed, inventoryVerified, ...safeProductBase } = storedProduct;
+      const safeVariant = chosenVariant ? {
+        id: String(chosenVariant.id || chosenVariant.color || chosenVariant.name || ''),
+        name: String(chosenVariant.name || chosenVariant.color || ''),
+        color: String(chosenVariant.color || chosenVariant.name || ''),
+        image: String(chosenVariant.image || chosenVariant.imageUrl || ''),
+        images: Array.isArray(chosenVariant.images) ? chosenVariant.images.filter(value => typeof value === 'string').slice(0, 20) : [],
+        sku: String(chosenVariant.sku || ''),
+      } : null;
+      const safeProduct = safeVariant ? {
+        ...safeProductBase,
+        image: safeVariant.image || safeProductBase.image,
+        images: safeVariant.images.length ? safeVariant.images : safeProductBase.images,
+      } : safeProductBase;
       const supplierUnitCost = supplierDetails?.unitCost ?? cost;
-      const supplierShippingCost = Number(supplierDetails?.shippingCost || 0);
-      const supplierCost = supplierUnitCost !== null && supplierUnitCost !== undefined && supplierUnitCost !== '' && Number.isFinite(Number(supplierUnitCost))
-        ? Number(supplierUnitCost) + (Number.isFinite(supplierShippingCost) ? supplierShippingCost : 0)
+      const shippingStatus = supplierDetails?.shippingStatus;
+      const supplierShippingCost = shippingStatus === 'free'
+        ? 0
+        : shippingStatus === 'paid' && supplierDetails?.shippingCost !== null && supplierDetails?.shippingCost !== undefined && supplierDetails?.shippingCost !== '' && Number.isFinite(Number(supplierDetails.shippingCost))
+          ? Number(supplierDetails.shippingCost)
+          : null;
+      const supplierCost = supplierUnitCost !== null && supplierUnitCost !== undefined && supplierUnitCost !== ''
+        && Number.isFinite(Number(supplierUnitCost)) && supplierShippingCost !== null
+        ? Number(supplierUnitCost) + supplierShippingCost
         : null;
-      items.push({ product: safeProduct, qty, supplierCost, supplierName: product.supplier || null });
+      items.push({ product: safeProduct, variant: safeVariant, qty, supplierCost, supplierName: product.supplier || null });
     }
     const subtotal = items.reduce((sum, item) => sum + Number(item.product.price) * item.qty, 0);
     const shipping = subtotal > 50 ? 0 : 4.99;
