@@ -28,7 +28,7 @@ Email verification and password reset are not implemented in this repository. Co
 
 ## Catalog, orders, and payment state
 
-Public catalog requests hide drafts, out-of-stock products, supplier details, and cost fields. Admin product and order routes require a valid JWT and role. Order totals are recomputed from the current catalog on the server; the browser's Paystack callback creates an order as `pending_verification`, never as paid. A super admin must compare the reference with Paystack and record the manual verification before that order can be used for a supplier purchase record. This code does not verify payments through Paystack's API.
+Public catalog requests hide drafts, out-of-stock products, supplier details, and cost fields. The API does not seed demo products; the original sample catalog records are kept as drafts so they can be recovered or removed by an admin. Add real products through the admin catalog before they appear in the storefront. Admin product and order routes require a valid JWT and role. Order totals are recomputed from the current catalog on the server; the browser's Paystack callback creates an order as `pending_verification`, never as paid. A super admin must compare the reference with Paystack and record the manual verification before that order can be used for a supplier purchase record. This code does not verify payments through Paystack's API.
 
 ## Dropshipping workspace
 
