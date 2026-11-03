@@ -40,6 +40,7 @@ const productSchema = new mongoose.Schema({
   isSample: { type: Boolean, default: false },
   stock: { type: Number, default: 10 },
   image: String,
+  images: { type: [String], default: [] },
   description: String,
   featured: { type: Boolean, default: false },
   tag: String,
@@ -446,7 +447,11 @@ app.post('/api/admin/products', authenticate, editorRoles, async (req, res) => {
     const category = String(req.body.category || '').trim();
     const price = Number(req.body.price);
     if (!name || !category || !Number.isFinite(price) || price <= 0) return res.status(400).json({ success: false, error: 'Product name, category, and a positive price are required.' });
-    const data = { ...req.body, name, category, price, id: Date.now(), status: ['Draft', 'Out of Stock'].includes(req.body.status) ? req.body.status : 'Active' };
+    const images = [...new Set((Array.isArray(req.body.images) ? req.body.images : [req.body.image])
+      .filter(value => typeof value === 'string')
+      .map(value => value.trim())
+      .filter(Boolean))];
+    const data = { ...req.body, name, category, price, image: images[0] || '', images, id: Date.now(), status: ['Draft', 'Out of Stock'].includes(req.body.status) ? req.body.status : 'Active' };
     delete data.isSample;
     const created = await saveProduct(data);
     res.status(201).json({ success: true, data: created });
@@ -461,6 +466,14 @@ app.patch('/api/admin/products/:id', authenticate, editorRoles, async (req, res)
     delete patch.id;
     delete patch._id;
     delete patch.isSample;
+    if (Object.prototype.hasOwnProperty.call(patch, 'images') || Object.prototype.hasOwnProperty.call(patch, 'image')) {
+      const images = [...new Set((Array.isArray(patch.images) ? patch.images : [patch.image ?? current.image])
+        .filter(value => typeof value === 'string')
+        .map(value => value.trim())
+        .filter(Boolean))];
+      patch.images = images;
+      patch.image = images[0] || '';
+    }
     if (patch.status && !['Active', 'Draft', 'Out of Stock'].includes(patch.status)) return res.status(400).json({ success: false, error: 'Invalid product status.' });
     if (current.isSample && patch.status === 'Active') patch.isSample = false;
     const saved = await saveProduct({ ...current, ...patch }, Number(req.params.id));
