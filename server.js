@@ -338,7 +338,7 @@ async function saveOrder(order) {
 app.get('/api/health', (_req, res) => {
   res.json({
     status: 'ok',
-    name: 'BrightCart API',
+    name: 'Shoppercart API',
     database: mongoose.connection.readyState === 1 ? 'connected' : 'memory-only',
     authenticationConfigured: Boolean(JWT_SECRET && JWT_SECRET.length >= 32),
     timestamp: new Date().toISOString(),
@@ -628,6 +628,6 @@ app.use('/api/dropship', createDropshipRouter({
 }));
 
 app.listen(PORT, async () => {
-  console.log(`🚀 BrightCart Backend API running on port ${PORT}`);
+  console.log(`🚀 Shoppercart Backend API running on port ${PORT}`);
   await connectDB();
 });

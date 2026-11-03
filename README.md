@@ -1,6 +1,6 @@
-# BrightCart Backend
+# Shoppercart Backend API
 
-Express and MongoDB API for the BrightCart storefront and admin workspace.
+Express and MongoDB API for the Shoppercart storefront and admin workspace.
 
 ## Run locally
 
@@ -13,7 +13,7 @@ Express and MongoDB API for the BrightCart storefront and admin workspace.
    npm run dev
    ```
 
-The API listens on `http://localhost:5000/api` by default. The frontend uses this URL unless `VITE_API_URL` overrides it. The API can start without MongoDB, but its in-memory users, research, purchases, and orders disappear when the process stops.
+The API listens on `http://localhost:5000/api` by default. The frontend uses this URL in local development; production must set `VITE_API_URL` to the deployed backend's `/api` URL. The API can start without MongoDB, but its in-memory users, research, purchases, and orders disappear when the process stops.
 
 ## Authentication and authorization
 
