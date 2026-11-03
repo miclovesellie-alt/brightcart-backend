@@ -5,19 +5,27 @@ import morgan from 'morgan';
 import mongoose from 'mongoose';
 import dotenv from 'dotenv';
 import crypto from 'crypto';
+import jwt from 'jsonwebtoken';
+import { createDropshipRouter } from './dropship.js';
 
 dotenv.config();
 
 const app = express();
 const PORT = process.env.PORT || 5000;
 const MONGODB_URI = process.env.MONGODB_URI;
-const SALT = 'brightcart_secure_salt_v1_2026';
-const SUPER_ADMIN_HASH = 'a8f09f09d505f641026da7912329dd4f847bde674134d960b3c884b5690190ae';
+const JWT_SECRET = process.env.JWT_SECRET;
+const LEGACY_SALT = 'brightcart_secure_salt_v1_2026';
+const memoryUsers = new Map();
+const memoryOrders = [];
+const loginFailures = new Map();
 
 // Middlewares
 app.use(helmet());
-app.use(cors({ origin: '*' }));
-app.use(express.json());
+const allowedOrigins = process.env.CORS_ORIGIN
+  ? process.env.CORS_ORIGIN.split(',').map(origin => origin.trim()).filter(Boolean)
+  : '*';
+app.use(cors({ origin: allowedOrigins }));
+app.use(express.json({ limit: '1mb' }));
 app.use(morgan('dev'));
 
 // MongoDB Schemas & Models
@@ -34,6 +42,17 @@ const productSchema = new mongoose.Schema({
   description: String,
   featured: { type: Boolean, default: false },
   tag: String,
+  sku: String,
+  cost: Number,
+  status: { type: String, enum: ['Active', 'Draft', 'Out of Stock'], default: 'Active' },
+  supplier: String,
+  supplierDetails: mongoose.Schema.Types.Mixed,
+  variants: [mongoose.Schema.Types.Mixed],
+  verifiedFacts: [String],
+  policyReviewed: { type: Boolean, default: false },
+  inventoryVerified: { type: Boolean, default: false },
+  researchId: String,
+  publishedAt: Date,
 }, { timestamps: true });
 
 const orderSchema = new mongoose.Schema({
@@ -44,10 +63,25 @@ const orderSchema = new mongoose.Schema({
   country: String,
   date: String,
   items: Array,
+  address: String,
+  city: String,
+  state: String,
+  paymentMethod: String,
+  subtotal: Number,
+  shipping: Number,
+  tax: Number,
   total: { type: Number, required: true },
   status: { type: String, default: 'Pending' },
-  supplier: { type: String, default: 'AliExpress' },
+  supplier: String,
   tracking: String,
+  paymentStatus: { type: String, enum: ['unpaid', 'pending_verification', 'paid', 'cancelled', 'refunded'], default: 'unpaid' },
+  paymentReference: String,
+  paymentVerification: String,
+  paymentVerifiedBy: String,
+  paymentVerifiedAt: Date,
+  supplierPurchaseStatus: { type: String, default: 'not_started' },
+  supplierPurchaseId: String,
+  supplierSpend: Number,
 }, { timestamps: true });
 
 const userSchema = new mongoose.Schema({
@@ -102,14 +136,155 @@ const INITIAL_PRODUCTS = [
   { id: 34, name: 'WirelessCharger Station 3-in-1', category: 'electrical', price: 69, originalPrice: 99, rating: 4.6, reviews: 301, stock: 80, image: '/charger.jpg', description: 'Charges phone + earbuds + watch simultaneously, 15W max, slim design, LED indicator.', featured: false, tag: '3-in-1' },
 ];
 
-function hashPassword(plaintext) {
-  return crypto.createHash('sha256').update(plaintext + SALT).digest('hex');
+const memoryProducts = [...INITIAL_PRODUCTS];
+
+function hashPassword(password) {
+  const salt = crypto.randomBytes(16);
+  return new Promise((resolve, reject) => {
+    crypto.scrypt(password, salt, 64, { N: 16384, r: 8, p: 1, maxmem: 64 * 1024 * 1024 }, (error, derived) => {
+      if (error) return reject(error);
+      resolve(`scrypt$${salt.toString('hex')}$${derived.toString('hex')}`);
+    });
+  });
+}
+
+function safeHashMatch(left, right) {
+  try {
+    const a = Buffer.from(left, 'hex');
+    const b = Buffer.from(right, 'hex');
+    return a.length === b.length && a.length > 0 && crypto.timingSafeEqual(a, b);
+  } catch {
+    return false;
+  }
+}
+
+async function verifyPassword(password, stored) {
+  if (typeof stored !== 'string') return false;
+  if (stored.startsWith('scrypt$')) {
+    const [, saltHex, expectedHex] = stored.split('$');
+    if (!saltHex || !expectedHex) return false;
+    return new Promise(resolve => {
+      crypto.scrypt(password, Buffer.from(saltHex, 'hex'), 64, { N: 16384, r: 8, p: 1, maxmem: 64 * 1024 * 1024 }, (error, derived) => {
+        resolve(!error && safeHashMatch(derived.toString('hex'), expectedHex));
+      });
+    });
+  }
+
+  // Upgrade old records after a successful login; this branch is migration-only.
+  const legacy = crypto.createHash('sha256').update(password + LEGACY_SALT).digest('hex');
+  return safeHashMatch(legacy, stored);
+}
+
+function publicUser(user) {
+  return {
+    id: String(user._id || user.id),
+    name: user.name,
+    email: user.email,
+    role: user.role,
+    status: user.status,
+    phone: user.phone || '',
+    country: user.country || '',
+  };
+}
+
+function signSession(user) {
+  if (!JWT_SECRET || JWT_SECRET.length < 32) throw new Error('JWT_SECRET must be configured with at least 32 characters.');
+  const token = jwt.sign({ sub: String(user._id || user.id) }, JWT_SECRET, { expiresIn: '8h' });
+  return { token, expiresAt: Date.now() + 8 * 60 * 60 * 1000 };
+}
+
+async function bootstrapSuperAdmin() {
+  const email = String(process.env.SUPER_ADMIN_EMAIL || '').trim().toLowerCase();
+  const password = process.env.SUPER_ADMIN_PASSWORD || '';
+  if (!email || password.length < 12) {
+    console.warn('⚠️ Super admin bootstrap skipped. Set SUPER_ADMIN_EMAIL and a 12+ character SUPER_ADMIN_PASSWORD.');
+    return;
+  }
+  const passwordHash = await hashPassword(password);
+  const userData = { name: 'Super Admin', email, role: 'super_admin', passwordHash, status: 'Active' };
+  if (mongoose.connection.readyState === 1) {
+    await User.findOneAndUpdate({ email }, { $set: userData }, { upsert: true, new: true, setDefaultsOnInsert: true });
+  } else {
+    const old = memoryUsers.get(email);
+    memoryUsers.set(email, { ...userData, id: old?.id || crypto.randomUUID() });
+  }
+  console.log(`✅ Super admin configured for ${email}.`);
+}
+
+async function findUserByEmail(email) {
+  const normalized = String(email || '').trim().toLowerCase();
+  if (mongoose.connection.readyState === 1) return User.findOne({ email: normalized });
+  return memoryUsers.get(normalized) || null;
+}
+
+async function findUserById(id) {
+  if (mongoose.connection.readyState === 1) {
+    if (!mongoose.isValidObjectId(id)) return null;
+    return User.findById(id);
+  }
+  return [...memoryUsers.values()].find(user => String(user.id) === String(id)) || null;
+}
+
+function saveUser(user) {
+  if (mongoose.connection.readyState === 1) return user.save();
+  memoryUsers.set(String(user.email).toLowerCase(), user);
+  return user;
+}
+
+function authenticate(req, res, next) {
+  const header = req.headers.authorization || '';
+  const match = header.match(/^Bearer\s+(.+)$/i);
+  if (!match) return res.status(401).json({ success: false, error: 'Sign in required.' });
+  if (!JWT_SECRET || JWT_SECRET.length < 32) return res.status(503).json({ success: false, error: 'Authentication is unavailable until JWT_SECRET is configured.' });
+  let claims;
+  try { claims = jwt.verify(match[1], JWT_SECRET); }
+  catch { return res.status(401).json({ success: false, error: 'Session is invalid or expired. Sign in again.' }); }
+  findUserById(claims.sub).then(user => {
+    if (!user || user.status !== 'Active') return res.status(401).json({ success: false, error: 'Account is unavailable. Sign in again.' });
+    req.user = user;
+    next();
+  }).catch(next);
+}
+
+function requireRoles(...roles) {
+  return (req, res, next) => {
+    if (!req.user || !roles.includes(req.user.role)) return res.status(403).json({ success: false, error: 'Your account role cannot perform this action.' });
+    next();
+  };
+}
+
+function loginAttemptKey(req, email) {
+  return `${req.ip || 'unknown'}:${String(email || '').trim().toLowerCase()}`;
+}
+
+function getLoginLock(key) {
+  const item = loginFailures.get(key);
+  if (!item) return null;
+  if (item.lockedUntil > Date.now()) return Math.ceil((item.lockedUntil - Date.now()) / 1000);
+  if (item.lockedUntil) {
+    item.lockedUntil = 0;
+    item.attempts = 0;
+  }
+  return null;
+}
+
+function recordLoginFailure(key) {
+  const item = loginFailures.get(key) || { attempts: 0, lockedUntil: 0, lockouts: 0 };
+  item.attempts += 1;
+  if (item.attempts >= 5) {
+    item.lockouts += 1;
+    item.lockedUntil = Date.now() + Math.min(30_000 * (2 ** (item.lockouts - 1)), 30 * 60_000);
+    item.attempts = 0;
+  }
+  loginFailures.set(key, item);
+  return getLoginLock(key);
 }
 
 // Database Connection & Auto-Seed
 async function connectDB() {
   if (!MONGODB_URI) {
     console.warn('⚠️ MONGODB_URI not provided. Running with in-memory store.');
+    await bootstrapSuperAdmin();
     return;
   }
   try {
@@ -123,121 +298,348 @@ async function connectDB() {
       console.log('🌱 Seeded 34 default products into MongoDB.');
     }
 
-    // Seed Super Admin if not exists
-    const adminExists = await User.findOne({ email: 'boafokyei3@gmail.com' });
-    if (!adminExists) {
-      await User.create({
-        name: 'Super Admin',
-        email: 'boafokyei3@gmail.com',
-        role: 'super_admin',
-        passwordHash: SUPER_ADMIN_HASH,
-        status: 'Active',
-      });
-      console.log('🌱 Created Super Admin user in MongoDB.');
-    }
+    await bootstrapSuperAdmin();
   } catch (err) {
     console.error('❌ MongoDB Connection Error:', err.message);
   }
 }
 
+async function getAllProducts() {
+  if (mongoose.connection.readyState === 1) return Product.find().lean();
+  return memoryProducts;
+}
+
+async function saveProduct(data, existingId = null) {
+  const id = existingId == null ? (Number(data.id) || Date.now()) : Number(existingId);
+  const next = { ...data, id };
+  if (mongoose.connection.readyState === 1) {
+    if (existingId != null) return Product.findOneAndUpdate({ id }, { $set: next }, { new: true, runValidators: true });
+    return Product.create(next);
+  }
+  const index = memoryProducts.findIndex(product => Number(product.id) === id);
+  if (index >= 0) memoryProducts[index] = { ...memoryProducts[index], ...next };
+  else memoryProducts.unshift(next);
+  return index >= 0 ? memoryProducts[index] : next;
+}
+
+async function findProduct(sku, name, id) {
+  if (id != null && Number.isFinite(id)) {
+    if (mongoose.connection.readyState === 1) return Product.findOne({ id }).lean();
+    return memoryProducts.find(product => Number(product.id) === id) || null;
+  }
+  const normalizedName = String(name || '').trim().toLowerCase();
+  const normalizedSku = String(sku || '').trim().toLowerCase();
+  if (!normalizedName && !normalizedSku) return null;
+  const products = await getAllProducts();
+  return products.find(product =>
+    (normalizedSku && String(product.sku || '').toLowerCase() === normalizedSku) ||
+    (normalizedName && String(product.name || '').trim().toLowerCase() === normalizedName)
+  ) || null;
+}
+
+async function getAllOrders() {
+  if (mongoose.connection.readyState === 1) return Order.find().sort({ createdAt: -1 }).lean();
+  return memoryOrders;
+}
+
+async function findOrder(id) {
+  const normalized = String(id);
+  if (mongoose.connection.readyState === 1) return Order.findOne({ id: normalized });
+  return memoryOrders.find(order => String(order.id) === normalized) || null;
+}
+
+async function saveOrder(order) {
+  if (mongoose.connection.readyState === 1) {
+    const found = await Order.findOne({ id: String(order.id) });
+    if (!found) return Order.create(order);
+    Object.assign(found, order);
+    return found.save();
+  }
+  const index = memoryOrders.findIndex(existing => String(existing.id) === String(order.id));
+  if (index < 0) memoryOrders.unshift(order);
+  else memoryOrders[index] = order;
+  return order;
+}
+
 // API Routes
-app.get('/api/health', (req, res) => {
+app.get('/api/health', (_req, res) => {
   res.json({
     status: 'ok',
     name: 'BrightCart API',
-    database: mongoose.connection.readyState === 1 ? 'connected' : 'disconnected',
-    timestamp: new Date().toISOString()
+    database: mongoose.connection.readyState === 1 ? 'connected' : 'memory-only',
+    authenticationConfigured: Boolean(JWT_SECRET && JWT_SECRET.length >= 32),
+    timestamp: new Date().toISOString(),
   });
 });
 
-// Products
-app.get('/api/products', async (req, res) => {
-  try {
-    if (mongoose.connection.readyState === 1) {
-      const items = await Product.find().sort({ id: 1 });
-      return res.json({ success: true, count: items.length, data: items });
-    }
-    res.json({ success: true, count: INITIAL_PRODUCTS.length, data: INITIAL_PRODUCTS });
-  } catch (e) {
-    res.status(500).json({ success: false, error: e.message });
+app.post('/api/auth/register', async (req, res) => {
+  const name = String(req.body.name || '').trim();
+  const email = String(req.body.email || '').trim().toLowerCase();
+  const password = String(req.body.password || '');
+  if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email) || !name || name.length > 100 || password.length < 10) {
+    return res.status(400).json({ success: false, error: 'Enter a valid email and name, and use a password of at least 10 characters.' });
   }
-});
-
-app.post('/api/products', async (req, res) => {
+  if (!JWT_SECRET || JWT_SECRET.length < 32) return res.status(503).json({ success: false, error: 'Authentication is not configured. Set a strong JWT_SECRET on the server.' });
   try {
-    const data = { ...req.body, id: Date.now() };
-    if (mongoose.connection.readyState === 1) {
-      const created = await Product.create(data);
-      return res.status(201).json({ success: true, data: created });
-    }
-    INITIAL_PRODUCTS.unshift(data);
-    res.status(201).json({ success: true, data });
-  } catch (e) {
-    res.status(500).json({ success: false, error: e.message });
-  }
-});
-
-// Orders
-app.get('/api/orders', async (req, res) => {
-  try {
-    if (mongoose.connection.readyState === 1) {
-      const allOrders = await Order.find().sort({ createdAt: -1 });
-      return res.json({ success: true, count: allOrders.length, data: allOrders });
-    }
-    res.json({ success: true, data: [] });
-  } catch (e) {
-    res.status(500).json({ success: false, error: e.message });
-  }
-});
-
-app.post('/api/orders', async (req, res) => {
-  try {
-    const orderData = {
-      id: `ORD-${Date.now().toString().slice(-4)}`,
-      date: new Date().toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' }),
-      status: 'Pending',
-      ...req.body
+    if (await findUserByEmail(email)) return res.status(409).json({ success: false, error: 'An account with this email already exists.' });
+    const userData = {
+      name,
+      email,
+      passwordHash: await hashPassword(password),
+      role: 'customer',
+      status: 'Active',
+      phone: String(req.body.phone || '').trim(),
+      country: String(req.body.country || '').trim(),
     };
-    if (mongoose.connection.readyState === 1) {
-      const newOrder = await Order.create(orderData);
-      return res.status(201).json({ success: true, data: newOrder });
+    let user;
+    if (mongoose.connection.readyState === 1) user = await User.create(userData);
+    else {
+      user = { ...userData, id: crypto.randomUUID() };
+      memoryUsers.set(email, user);
     }
-    res.status(201).json({ success: true, data: orderData });
-  } catch (e) {
-    res.status(500).json({ success: false, error: e.message });
+    const session = signSession(user);
+    res.status(201).json({ success: true, ...session, user: publicUser(user) });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
   }
 });
 
-// Auth
 app.post('/api/auth/login', async (req, res) => {
-  const { email, password } = req.body;
-  if (!email || !password) return res.status(400).json({ success: false, error: 'Email and password required' });
-
+  const email = String(req.body.email || '').trim().toLowerCase();
+  const password = String(req.body.password || '');
+  if (!email || !password) return res.status(400).json({ success: false, error: 'Email and password are required.' });
+  if (!JWT_SECRET || JWT_SECRET.length < 32) return res.status(503).json({ success: false, error: 'Authentication is not configured. Set a strong JWT_SECRET on the server.' });
+  const attemptKey = loginAttemptKey(req, email);
+  const waitSeconds = getLoginLock(attemptKey);
+  if (waitSeconds) return res.status(429).json({ success: false, error: `Too many failed attempts. Try again in ${waitSeconds} seconds.`, retryAfter: waitSeconds });
   try {
-    let user = null;
-    if (mongoose.connection.readyState === 1) {
-      user = await User.findOne({ email: email.toLowerCase() });
+    const user = await findUserByEmail(email);
+    const legacySuperAdmin = user?.role === 'super_admin' && !String(user.passwordHash || '').startsWith('scrypt$');
+    const bootstrappedEmail = String(process.env.SUPER_ADMIN_EMAIL || '').trim().toLowerCase();
+    const valid = user && user.status === 'Active' && !(legacySuperAdmin && bootstrappedEmail !== email) && await verifyPassword(password, user.passwordHash);
+    if (!valid) {
+      const retryAfter = recordLoginFailure(attemptKey);
+      if (retryAfter) return res.status(429).json({ success: false, error: `Too many failed attempts. Try again in ${retryAfter} seconds.`, retryAfter });
+      return res.status(401).json({ success: false, error: 'Invalid email or password.' });
     }
-
-    if (!user) {
-      return res.json({ success: true, user: { name: email.split('@')[0], email, role: 'customer' } });
+    loginFailures.delete(attemptKey);
+    if (!String(user.passwordHash).startsWith('scrypt$')) {
+      user.passwordHash = await hashPassword(password);
+      await saveUser(user);
     }
-
-    const hash = hashPassword(password);
-    if (hash === user.passwordHash) {
-      const token = crypto.randomBytes(32).toString('hex');
-      return res.json({
-        success: true,
-        token,
-        user: { name: user.name, email: user.email, role: user.role, status: user.status }
-      });
-    }
-
-    return res.status(401).json({ success: false, error: 'Invalid email or password' });
-  } catch (e) {
-    res.status(500).json({ success: false, error: e.message });
+    const session = signSession(user);
+    res.json({ success: true, ...session, user: publicUser(user) });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
   }
 });
+
+app.get('/api/auth/me', authenticate, (req, res) => {
+  res.json({ success: true, user: publicUser(req.user) });
+});
+
+// The storefront sees only live products. Legacy catalog records without a status remain visible.
+app.get('/api/products', async (_req, res) => {
+  try {
+    const products = await getAllProducts();
+    const items = products.filter(product => product.status !== 'Draft' && product.status !== 'Out of Stock')
+      .sort((a, b) => Number(a.id) - Number(b.id))
+      .map(product => {
+        const { cost, supplier, supplierDetails, verifiedFacts, policyReviewed, inventoryVerified, researchId, ...publicProduct } = product.toObject ? product.toObject() : product;
+        return publicProduct;
+      });
+    res.json({ success: true, count: items.length, data: items });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+const adminRoles = requireRoles('super_admin', 'admin', 'moderator');
+const editorRoles = requireRoles('super_admin', 'admin');
+
+app.get('/api/admin/products', authenticate, editorRoles, async (_req, res) => {
+  try { res.json({ success: true, data: (await getAllProducts()).sort((a, b) => Number(b.id) - Number(a.id)) }); }
+  catch (error) { res.status(500).json({ success: false, error: error.message }); }
+});
+
+app.post('/api/admin/products', authenticate, editorRoles, async (req, res) => {
+  try {
+    const name = String(req.body.name || '').trim();
+    const category = String(req.body.category || '').trim();
+    const price = Number(req.body.price);
+    if (!name || !category || !Number.isFinite(price) || price <= 0) return res.status(400).json({ success: false, error: 'Product name, category, and a positive price are required.' });
+    const data = { ...req.body, name, category, price, id: Date.now(), status: ['Draft', 'Out of Stock'].includes(req.body.status) ? req.body.status : 'Active' };
+    const created = await saveProduct(data);
+    res.status(201).json({ success: true, data: created });
+  } catch (error) { res.status(500).json({ success: false, error: error.message }); }
+});
+
+app.patch('/api/admin/products/:id', authenticate, editorRoles, async (req, res) => {
+  try {
+    const current = await findProduct(null, null, Number(req.params.id));
+    if (!current) return res.status(404).json({ success: false, error: 'Product not found.' });
+    const patch = { ...req.body };
+    delete patch.id;
+    delete patch._id;
+    if (patch.status && !['Active', 'Draft', 'Out of Stock'].includes(patch.status)) return res.status(400).json({ success: false, error: 'Invalid product status.' });
+    const saved = await saveProduct({ ...current, ...patch }, Number(req.params.id));
+    res.json({ success: true, data: saved });
+  } catch (error) { res.status(500).json({ success: false, error: error.message }); }
+});
+
+app.delete('/api/admin/products/:id', authenticate, editorRoles, async (req, res) => {
+  try {
+    const id = Number(req.params.id);
+    if (mongoose.connection.readyState === 1) await Product.deleteOne({ id });
+    else {
+      const index = memoryProducts.findIndex(product => Number(product.id) === id);
+      if (index >= 0) memoryProducts.splice(index, 1);
+    }
+    res.json({ success: true });
+  } catch (error) { res.status(500).json({ success: false, error: error.message }); }
+});
+
+async function createOrder(req, res) {
+  try {
+    const customer = String(req.body.customer || req.body.name || '').trim();
+    const email = String(req.body.email || '').trim().toLowerCase();
+    const incomingItems = Array.isArray(req.body.items) ? req.body.items : [];
+    if (!customer || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email) || incomingItems.length === 0) {
+      return res.status(400).json({ success: false, error: 'Customer name, valid email, and at least one product are required.' });
+    }
+    const catalog = await getAllProducts();
+    const items = [];
+    for (const incoming of incomingItems) {
+      const productId = incoming.product?.id ?? incoming.productId;
+      const product = catalog.find(item => String(item.id) === String(productId) && item.status !== 'Draft' && item.status !== 'Out of Stock');
+      const qty = Number(incoming.qty || 1);
+      if (!product || !Number.isInteger(qty) || qty < 1 || qty > 99) return res.status(400).json({ success: false, error: 'A product is unavailable or has an invalid quantity. Refresh the cart and try again.' });
+      const { cost, supplier, supplierDetails, verifiedFacts, policyReviewed, inventoryVerified, ...safeProduct } = product.toObject ? product.toObject() : product;
+      const supplierUnitCost = supplierDetails?.unitCost ?? cost;
+      const supplierShippingCost = Number(supplierDetails?.shippingCost || 0);
+      const supplierCost = supplierUnitCost !== null && supplierUnitCost !== undefined && supplierUnitCost !== '' && Number.isFinite(Number(supplierUnitCost))
+        ? Number(supplierUnitCost) + (Number.isFinite(supplierShippingCost) ? supplierShippingCost : 0)
+        : null;
+      items.push({ product: safeProduct, qty, supplierCost, supplierName: product.supplier || null });
+    }
+    const subtotal = items.reduce((sum, item) => sum + Number(item.product.price) * item.qty, 0);
+    const shipping = subtotal > 50 ? 0 : 4.99;
+    const tax = subtotal * 0.08;
+    const paystack = String(req.body.paymentMethod || '').toLowerCase().includes('paystack');
+    const order = {
+      id: `ORD-${Date.now()}-${crypto.randomBytes(2).toString('hex')}`,
+      customer,
+      email,
+      phone: String(req.body.phone || '').trim(),
+      country: String(req.body.country || '').trim(),
+      address: String(req.body.address || '').trim(),
+      city: String(req.body.city || '').trim(),
+      state: String(req.body.state || '').trim(),
+      date: new Date().toISOString(),
+      items,
+      subtotal,
+      shipping,
+      tax,
+      total: subtotal + shipping + tax,
+      status: paystack ? 'Pending payment verification' : 'Pending',
+      paymentStatus: paystack ? 'pending_verification' : 'unpaid',
+      paymentReference: paystack ? String(req.body.paymentRef || '').trim() : undefined,
+      paymentVerification: paystack ? 'client_callback_unverified' : undefined,
+      paymentMethod: String(req.body.paymentMethod || ''),
+      supplierPurchaseStatus: 'not_started',
+    };
+    const created = await saveOrder(order);
+    res.status(201).json({ success: true, data: created, paymentStatus: created.paymentStatus });
+  } catch (error) { res.status(500).json({ success: false, error: error.message }); }
+}
+
+app.post('/api/orders', createOrder);
+app.get('/api/admin/orders', authenticate, adminRoles, async (_req, res) => {
+  try { res.json({ success: true, data: await getAllOrders() }); }
+  catch (error) { res.status(500).json({ success: false, error: error.message }); }
+});
+app.get('/api/orders', authenticate, adminRoles, async (_req, res) => {
+  try { res.json({ success: true, data: await getAllOrders() }); }
+  catch (error) { res.status(500).json({ success: false, error: error.message }); }
+});
+app.get('/api/account/orders', authenticate, async (req, res) => {
+  try {
+    const orders = (await getAllOrders()).filter(order => String(order.email || '').toLowerCase() === String(req.user.email).toLowerCase());
+    res.json({ success: true, data: orders.map(order => ({ ...order, items: (order.items || []).map(item => ({ ...item, supplierCost: undefined, supplierName: undefined })) })) });
+  } catch (error) { res.status(500).json({ success: false, error: error.message }); }
+});
+
+app.patch('/api/admin/orders/:id', authenticate, adminRoles, async (req, res) => {
+  try {
+    const order = await findOrder(req.params.id);
+    if (!order) return res.status(404).json({ success: false, error: 'Order not found.' });
+    if (req.body.status && ['Pending', 'Processing', 'Shipped', 'Delivered', 'Cancelled', 'Canceled', 'Refunded'].includes(req.body.status)) order.status = req.body.status;
+    await saveOrder(order);
+    res.json({ success: true, data: order });
+  } catch (error) { res.status(500).json({ success: false, error: error.message }); }
+});
+
+app.get('/api/admin/users', authenticate, requireRoles('super_admin'), async (_req, res) => {
+  try {
+    const users = mongoose.connection.readyState === 1
+      ? await User.find().select('-passwordHash').sort({ createdAt: -1 }).lean()
+      : [...memoryUsers.values()];
+    res.json({ success: true, data: users.map(publicUser) });
+  } catch (error) { res.status(500).json({ success: false, error: error.message }); }
+});
+
+app.post('/api/admin/users', authenticate, requireRoles('super_admin'), async (req, res) => {
+  const name = String(req.body.name || '').trim();
+  const email = String(req.body.email || '').trim().toLowerCase();
+  const password = String(req.body.password || '');
+  const role = ['admin', 'moderator'].includes(req.body.role) ? req.body.role : 'moderator';
+  if (!name || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email) || password.length < 10) return res.status(400).json({ success: false, error: 'Name, valid email, and 10+ character password are required.' });
+  if (await findUserByEmail(email)) return res.status(409).json({ success: false, error: 'An account with this email already exists.' });
+  try {
+    const userData = { name, email, passwordHash: await hashPassword(password), role, status: 'Active' };
+    const user = mongoose.connection.readyState === 1 ? await User.create(userData) : { ...userData, id: crypto.randomUUID() };
+    if (mongoose.connection.readyState !== 1) memoryUsers.set(email, user);
+    res.status(201).json({ success: true, data: publicUser(user) });
+  } catch (error) { res.status(500).json({ success: false, error: error.message }); }
+});
+
+app.patch('/api/admin/users/:id', authenticate, requireRoles('super_admin'), async (req, res) => {
+  try {
+    const user = mongoose.connection.readyState === 1
+      ? await User.findById(req.params.id)
+      : [...memoryUsers.values()].find(item => String(item.id) === String(req.params.id));
+    if (!user || user.role === 'super_admin') return res.status(404).json({ success: false, error: 'Managed team member not found.' });
+    if (['Active', 'Disabled'].includes(req.body.status)) user.status = req.body.status;
+    if (['admin', 'moderator'].includes(req.body.role)) user.role = req.body.role;
+    if (typeof req.body.password === 'string' && req.body.password.length >= 10) user.passwordHash = await hashPassword(req.body.password);
+    if (mongoose.connection.readyState === 1) await user.save();
+    else memoryUsers.set(String(user.email).toLowerCase(), user);
+    res.json({ success: true, data: publicUser(user) });
+  } catch (error) { res.status(500).json({ success: false, error: error.message }); }
+});
+
+app.delete('/api/admin/users/:id', authenticate, requireRoles('super_admin'), async (req, res) => {
+  try {
+    if (mongoose.connection.readyState === 1) await User.deleteOne({ _id: req.params.id, role: { $ne: 'super_admin' } });
+    else {
+      const entry = [...memoryUsers.entries()].find(([, user]) => String(user.id) === String(req.params.id) && user.role !== 'super_admin');
+      if (entry) memoryUsers.delete(entry[0]);
+    }
+    res.json({ success: true });
+  } catch (error) { res.status(500).json({ success: false, error: error.message }); }
+});
+
+app.use('/api/dropship', createDropshipRouter({
+  authenticate,
+  requireAdmin: adminRoles,
+  requirePublisher: editorRoles,
+  getAllProducts,
+  getAllOrders,
+  saveProduct,
+  findProduct,
+  saveOrder,
+  findOrder,
+}));
 
 app.listen(PORT, async () => {
   console.log(`🚀 BrightCart Backend API running on port ${PORT}`);
