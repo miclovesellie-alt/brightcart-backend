@@ -18,6 +18,13 @@ const LEGACY_SALT = 'brightcart_secure_salt_v1_2026';
 const memoryUsers = new Map();
 const memoryOrders = [];
 const loginFailures = new Map();
+const DEFAULT_STORE_SETTINGS = {
+  supportEmail: '',
+  whatsappNumber: '',
+  notificationEmail: '',
+  socials: { instagram: '', facebook: '', tiktok: '', youtube: '', x: '' },
+  notifications: { customerOrderConfirmation: true, adminNewOrder: true, customerOrderStatus: true },
+};
 
 // Middlewares
 app.use(helmet());
@@ -97,9 +104,30 @@ const userSchema = new mongoose.Schema({
   country: String,
 }, { timestamps: true });
 
+const storeSettingsSchema = new mongoose.Schema({
+  key: { type: String, default: 'main', unique: true },
+  supportEmail: { type: String, default: '' },
+  whatsappNumber: { type: String, default: '' },
+  notificationEmail: { type: String, default: '' },
+  socials: {
+    instagram: { type: String, default: '' },
+    facebook: { type: String, default: '' },
+    tiktok: { type: String, default: '' },
+    youtube: { type: String, default: '' },
+    x: { type: String, default: '' },
+  },
+  notifications: {
+    customerOrderConfirmation: { type: Boolean, default: true },
+    adminNewOrder: { type: Boolean, default: true },
+    customerOrderStatus: { type: Boolean, default: true },
+  },
+}, { timestamps: true });
+
 const Product = mongoose.model('Product', productSchema);
 const Order = mongoose.model('Order', orderSchema);
 const User = mongoose.model('User', userSchema);
+const StoreSettings = mongoose.model('StoreSettings', storeSettingsSchema);
+let memoryStoreSettings = JSON.parse(JSON.stringify(DEFAULT_STORE_SETTINGS));
 
 // Initial Products Data
 // IDs 1–34 belong to the original sample catalog. Keep them out of the live store.
@@ -336,6 +364,157 @@ async function saveOrder(order) {
   return order;
 }
 
+function publicStoreSettings(settings = {}) {
+  return {
+    supportEmail: String(settings.supportEmail || ''),
+    whatsappNumber: String(settings.whatsappNumber || ''),
+    notificationEmail: String(settings.notificationEmail || ''),
+    socials: { ...DEFAULT_STORE_SETTINGS.socials, ...(settings.socials || {}) },
+    notifications: { ...DEFAULT_STORE_SETTINGS.notifications, ...(settings.notifications || {}) },
+  };
+}
+
+async function getStoreSettings() {
+  if (mongoose.connection.readyState === 1) {
+    const settings = await StoreSettings.findOne({ key: 'main' }).lean();
+    return publicStoreSettings(settings || DEFAULT_STORE_SETTINGS);
+  }
+  return publicStoreSettings(memoryStoreSettings);
+}
+
+async function saveStoreSettings(settings) {
+  const next = publicStoreSettings(settings);
+  if (mongoose.connection.readyState === 1) {
+    return StoreSettings.findOneAndUpdate(
+      { key: 'main' },
+      { $set: next, $setOnInsert: { key: 'main' } },
+      { new: true, upsert: true, setDefaultsOnInsert: true },
+    ).lean();
+  }
+  memoryStoreSettings = next;
+  return publicStoreSettings(memoryStoreSettings);
+}
+
+function optionalEmail(value) {
+  const email = String(value || '').trim().toLowerCase();
+  if (!email) return '';
+  if (email.length > 254 || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) throw new Error('Enter a valid email address or leave it blank.');
+  return email;
+}
+
+function optionalSocialUrl(value) {
+  const input = String(value || '').trim();
+  if (!input) return '';
+  try {
+    const url = new URL(input);
+    if (!['http:', 'https:'].includes(url.protocol)) throw new Error();
+    return url.toString();
+  } catch {
+    throw new Error('Social links must be complete http or https URLs.');
+  }
+}
+
+function optionalWhatsAppNumber(value) {
+  const input = String(value || '').trim();
+  if (!input) return '';
+  let digits = input.replace(/\D/g, '');
+  if (/^https?:\/\//i.test(input)) {
+    const url = new URL(input);
+    if (!['wa.me', 'api.whatsapp.com', 'web.whatsapp.com'].includes(url.hostname.toLowerCase())) {
+      throw new Error('Enter a WhatsApp phone number or WhatsApp link.');
+    }
+    digits = (url.pathname.match(/\d+/g) || []).join('') || (url.searchParams.get('phone') || '').replace(/\D/g, '');
+  }
+  if (digits.length < 8 || digits.length > 15) throw new Error('Enter a WhatsApp number with its country code.');
+  return digits;
+}
+
+function normalizeStoreSettingsInput(input = {}, current = DEFAULT_STORE_SETTINGS) {
+  const existing = publicStoreSettings(current);
+  const socials = { ...existing.socials };
+  const notifications = { ...existing.notifications };
+  const allowedSocials = Object.keys(socials);
+  const allowedNotifications = Object.keys(notifications);
+  if (input.socials && typeof input.socials === 'object') {
+    for (const key of allowedSocials) if (key in input.socials) socials[key] = optionalSocialUrl(input.socials[key]);
+  }
+  if (input.notifications && typeof input.notifications === 'object') {
+    for (const key of allowedNotifications) if (key in input.notifications) notifications[key] = Boolean(input.notifications[key]);
+  }
+  return {
+    supportEmail: 'supportEmail' in input ? optionalEmail(input.supportEmail) : existing.supportEmail,
+    notificationEmail: 'notificationEmail' in input ? optionalEmail(input.notificationEmail) : existing.notificationEmail,
+    whatsappNumber: 'whatsappNumber' in input ? optionalWhatsAppNumber(input.whatsappNumber) : existing.whatsappNumber,
+    socials,
+    notifications,
+  };
+}
+
+function escapeHtml(value) {
+  return String(value ?? '').replace(/[&<>"']/g, character => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[character]);
+}
+
+function emailProviderStatus() {
+  return {
+    configured: Boolean(process.env.RESEND_API_KEY && process.env.EMAIL_FROM),
+    sender: process.env.EMAIL_FROM ? String(process.env.EMAIL_FROM).trim() : '',
+    provider: 'Resend',
+  };
+}
+
+async function sendTransactionalEmail({ to, subject, text, html }) {
+  const status = emailProviderStatus();
+  if (!status.configured || !to) return false;
+  const response = await fetch('https://api.resend.com/emails', {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${process.env.RESEND_API_KEY}`, 'Content-Type': 'application/json' },
+    body: JSON.stringify({ from: status.sender, to: [to], subject, text, html }),
+  });
+  if (!response.ok) throw new Error(`Email provider returned ${response.status}: ${(await response.text()).slice(0, 300)}`);
+  return true;
+}
+
+async function notifyOrderCreated(order) {
+  const settings = await getStoreSettings();
+  const notifications = settings.notifications;
+  const itemsText = (order.items || []).map(item => `${item.qty} × ${item.product?.name || 'Product'}`).join('\n');
+  const itemsHtml = (order.items || []).map(item => `<li>${escapeHtml(item.qty)} × ${escapeHtml(item.product?.name || 'Product')}</li>`).join('');
+  const total = Number(order.total || 0).toFixed(2);
+  const customerTasks = notifications.customerOrderConfirmation
+    ? [sendTransactionalEmail({
+      to: order.email,
+      subject: `Shoppercart order ${order.id} received`,
+      text: `Hi ${order.customer},\n\nWe received your order ${order.id}.\n${itemsText}\nTotal: ${total}\nStatus: ${order.status}\n\nThank you for shopping with Shoppercart.`,
+      html: `<p>Hi ${escapeHtml(order.customer)},</p><p>We received your order <strong>${escapeHtml(order.id)}</strong>.</p><ul>${itemsHtml}</ul><p>Total: <strong>${escapeHtml(total)}</strong></p><p>Status: ${escapeHtml(order.status)}</p><p>Thank you for shopping with Shoppercart.</p>`,
+    })]
+    : [];
+  const adminTasks = notifications.adminNewOrder && settings.notificationEmail
+    ? [sendTransactionalEmail({
+      to: settings.notificationEmail,
+      subject: `New Shoppercart order ${order.id}`,
+      text: `${order.customer} placed an order.\nCustomer: ${order.email}\n${itemsText}\nTotal: ${total}`,
+      html: `<p><strong>${escapeHtml(order.customer)}</strong> placed order ${escapeHtml(order.id)}.</p><p>Customer: ${escapeHtml(order.email)}</p><ul>${itemsHtml}</ul><p>Total: <strong>${escapeHtml(total)}</strong></p>`,
+    })]
+    : [];
+  const results = await Promise.allSettled([...customerTasks, ...adminTasks]);
+  results.filter(result => result.status === 'rejected').forEach(result => console.error('Order notification email failed:', result.reason?.message));
+}
+
+async function notifyOrderStatusChanged(order) {
+  const settings = await getStoreSettings();
+  if (!settings.notifications.customerOrderStatus) return;
+  try {
+    await sendTransactionalEmail({
+      to: order.email,
+      subject: `Shoppercart order ${order.id} update`,
+      text: `Hi ${order.customer},\n\nYour order ${order.id} is now ${order.status}.\n\nThank you for shopping with Shoppercart.`,
+      html: `<p>Hi ${escapeHtml(order.customer)},</p><p>Your order <strong>${escapeHtml(order.id)}</strong> is now <strong>${escapeHtml(order.status)}</strong>.</p><p>Thank you for shopping with Shoppercart.</p>`,
+    });
+  } catch (error) {
+    console.error('Order status email failed:', error.message);
+  }
+}
+
 // API Routes
 app.get('/api/health', (_req, res) => {
   res.json({
@@ -345,6 +524,14 @@ app.get('/api/health', (_req, res) => {
     authenticationConfigured: Boolean(JWT_SECRET && JWT_SECRET.length >= 32),
     timestamp: new Date().toISOString(),
   });
+});
+
+app.get('/api/store-settings', async (_req, res) => {
+  try {
+    const settings = await getStoreSettings();
+    res.json({ success: true, data: { supportEmail: settings.supportEmail, whatsappNumber: settings.whatsappNumber, socials: settings.socials } });
+  }
+  catch (error) { res.status(500).json({ success: false, error: error.message }); }
 });
 
 app.post('/api/auth/register', async (req, res) => {
@@ -436,6 +623,22 @@ app.get('/api/products', async (_req, res) => {
 
 const adminRoles = requireRoles('super_admin', 'admin', 'moderator');
 const editorRoles = requireRoles('super_admin', 'admin');
+const storeSettingsAdmin = requireRoles('super_admin');
+
+app.get('/api/admin/store-settings', authenticate, storeSettingsAdmin, async (_req, res) => {
+  try {
+    res.json({ success: true, data: await getStoreSettings(), email: emailProviderStatus() });
+  } catch (error) { res.status(500).json({ success: false, error: error.message }); }
+});
+
+app.patch('/api/admin/store-settings', authenticate, storeSettingsAdmin, async (req, res) => {
+  try {
+    const current = await getStoreSettings();
+    const next = normalizeStoreSettingsInput(req.body || {}, current);
+    await saveStoreSettings(next);
+    res.json({ success: true, data: next, email: emailProviderStatus() });
+  } catch (error) { res.status(400).json({ success: false, error: error.message }); }
+});
 
 app.get('/api/admin/products', authenticate, editorRoles, async (_req, res) => {
   try { res.json({ success: true, data: (await getAllProducts()).sort((a, b) => Number(b.id) - Number(a.id)) }); }
@@ -584,6 +787,7 @@ async function createOrder(req, res) {
       supplierPurchaseStatus: 'not_started',
     };
     const created = await saveOrder(order);
+    void notifyOrderCreated(created).catch(error => console.error('Could not prepare order notification:', error.message));
     res.status(201).json({ success: true, data: created, paymentStatus: created.paymentStatus });
   } catch (error) { res.status(500).json({ success: false, error: error.message }); }
 }
@@ -608,8 +812,10 @@ app.patch('/api/admin/orders/:id', authenticate, adminRoles, async (req, res) =>
   try {
     const order = await findOrder(req.params.id);
     if (!order) return res.status(404).json({ success: false, error: 'Order not found.' });
+    const previousStatus = order.status;
     if (req.body.status && ['Pending', 'Processing', 'Shipped', 'Delivered', 'Cancelled', 'Canceled', 'Refunded'].includes(req.body.status)) order.status = req.body.status;
     await saveOrder(order);
+    if (previousStatus !== order.status) void notifyOrderStatusChanged(order).catch(error => console.error('Could not prepare order status email:', error.message));
     res.json({ success: true, data: order });
   } catch (error) { res.status(500).json({ success: false, error: error.message }); }
 });

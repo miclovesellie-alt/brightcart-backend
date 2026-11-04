@@ -26,6 +26,10 @@ The API listens on `http://localhost:5000/api` by default. The frontend uses thi
 
 Email verification and password reset are not implemented in this repository. Configure HTTPS and a strong, private JWT secret before exposing the API publicly.
 
+## Store contact and order emails
+
+Super admins can edit the storefront support email, WhatsApp number, social links, admin notification inbox, and order-email preferences from **Admin → Settings**. Public contact links are saved in MongoDB and shown in the storefront footer. Order confirmation, new-order, and order-status emails are sent through Resend when `RESEND_API_KEY` and a verified `EMAIL_FROM` sender are set on the backend. The API key must stay on the backend host. Set the admin inbox and choose which order emails to send in Admin → Settings.
+
 ## Catalog, orders, and payment state
 
 Public catalog requests hide drafts, out-of-stock products, supplier details, and cost fields. The API does not seed demo products; the original sample catalog records are kept as drafts so they can be recovered or removed by an admin. Add real products through the admin catalog before they appear in the storefront. Admin product and order routes require a valid JWT and role. Order totals are recomputed from the current catalog on the server; the browser's Paystack callback creates an order as `pending_verification`, never as paid. A super admin must compare the reference with Paystack and record the manual verification before that order can be used for a supplier purchase record. This code does not verify payments through Paystack's API.
