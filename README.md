@@ -28,7 +28,7 @@ Email verification and password reset are not implemented in this repository. Co
 
 ## Store contact and order emails
 
-Super admins can edit the storefront support email, WhatsApp number, social links, admin notification inbox, and order-email preferences from **Admin → Settings**. Public contact links are saved in MongoDB and shown in the storefront footer. Order confirmation, new-order, and order-status emails are sent through Resend when `RESEND_API_KEY` and a verified `EMAIL_FROM` sender are set on the backend. The API key must stay on the backend host. Set the admin inbox and choose which order emails to send in Admin → Settings.
+Super admins can edit the storefront support email, WhatsApp number, social links, admin notification inbox, and order-email preferences from **Admin → Settings**. Public contact links are saved in MongoDB and shown in the storefront footer. Order confirmation, new-order, and order-status emails are sent through Resend when `RESEND_API_KEY` and a verified `EMAIL_FROM` sender are set on the backend. Keep the API key on the backend host. Set the admin inbox and choose which order emails to send in Admin → Settings.
 
 ## Catalog, orders, and payment state
 
@@ -53,3 +53,4 @@ No supplier API or credentials are included. Stock sync and automatic purchasing
 ## Environment
 
 See `.env.example` for the supported settings. Keep `.env` and all real secrets out of source control. `CORS_ORIGIN` accepts a comma-separated list of frontend origins.
+
