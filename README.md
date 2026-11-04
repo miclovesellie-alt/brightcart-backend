@@ -42,10 +42,11 @@ The score uses only entered or extracted costs, stock, and shipping estimates, a
 
 AI product copy tries the configured providers in this order: Gemini, Groq, then local Ollama. HTTP errors, quota exhaustion, and invalid responses move to the next configured provider. The code does not use a paid-provider fallback or send AI requests for product extraction or pricing; provider keys and model overrides are optional server-side settings. Keep Gemini and Groq projects on a free tier if you want to avoid provider charges. AI copy is only generated from recorded facts and remains a draft for human review. Set `GEMINI_API_KEY` and/or `GROQ_API_KEY`; Ollama can be configured with `OLLAMA_BASE_URL` and `OLLAMA_MODEL`.
 
-Suggested retail price is calculated deterministically from the known supplier cost and destination shipping using `DROPSHIP_TARGET_MARGIN_PERCENT`, `DROPSHIP_PAYMENT_FEE_PERCENT`, `DROPSHIP_PLATFORM_FEE_PERCENT`, and `DROPSHIP_PRICE_ROUNDING_INCREMENT`. The default target gross margin is 35%; absent fee settings default to 0% and should be configured to match actual payment/platform charges before publishing. If shipping is unknown, no automatic price is suggested.
+Suggested retail price is calculated deterministically to target a fixed 20% contribution margin after configured payment and platform fees, using the confirmed supplier cost and destination shipping where available. When shipping is unknown or stated in a different currency, the initial draft price uses supplier unit cost only and is clearly flagged for review; confirming shipping and recalculating updates the price. `DROPSHIP_PAYMENT_FEE_PERCENT`, `DROPSHIP_PLATFORM_FEE_PERCENT`, and `DROPSHIP_PRICE_ROUNDING_INCREMENT` control actual fees and rounding. Absent fee settings default to 0% and should be configured before publishing.
 
 No supplier API or credentials are included. Stock sync and automatic purchasing are off. The fulfillment page can record supplier orders placed manually through an authorized supplier channel, after an order is marked paid. MongoDB stores these records when connected; otherwise they are temporary in-memory records.
 
 ## Environment
 
 See `.env.example` for the supported settings. Keep `.env` and all real secrets out of source control. `CORS_ORIGIN` accepts a comma-separated list of frontend origins.
+
