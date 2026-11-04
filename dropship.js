@@ -445,7 +445,7 @@ function normalizeCategory(value) {
   if (/smart ?phone|mobile phone|cell phone|\bphone\b/.test(category)) return 'phones';
   if (/laptop|computer accessory/.test(category)) return 'laptop-accessories';
   if (/electrical appliance|electrical|power adapter/.test(category)) return 'electrical';
-  return '';
+  return category.replace(/&/g, 'and').replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '').slice(0, 60);
 }
 
 function shippingFromSchema(product, destination) {
@@ -484,12 +484,11 @@ function shippingFromSchema(product, destination) {
 }
 
 function pricePolicy() {
-  const targetMarginPercent = Number(process.env.DROPSHIP_TARGET_MARGIN_PERCENT ?? 35);
   const paymentFeePercent = Number(process.env.DROPSHIP_PAYMENT_FEE_PERCENT ?? 0);
   const platformFeePercent = Number(process.env.DROPSHIP_PLATFORM_FEE_PERCENT ?? 0);
   const roundingIncrement = Number(process.env.DROPSHIP_PRICE_ROUNDING_INCREMENT ?? 1);
   return {
-    targetMarginPercent: Number.isFinite(targetMarginPercent) && targetMarginPercent > 0 && targetMarginPercent < 100 ? targetMarginPercent : 35,
+    targetMarginPercent: 20,
     paymentFeePercent: Number.isFinite(paymentFeePercent) && paymentFeePercent >= 0 ? paymentFeePercent : 0,
     platformFeePercent: Number.isFinite(platformFeePercent) && platformFeePercent >= 0 ? platformFeePercent : 0,
     roundingIncrement: Number.isFinite(roundingIncrement) && roundingIncrement > 0 ? roundingIncrement : 1,
@@ -557,8 +556,8 @@ function parseProductHtml(html, finalUrl, destination) {
   const sourceCurrency = offer.currency;
   const sameCurrencyShipping = destinationShipping.status === 'free'
     || (destinationShipping.status === 'paid' && sourceCurrency && destinationShipping.currency === sourceCurrency);
-  const suggestedRetailPrice = offer.price && sameCurrencyShipping
-    ? recommendRetailPrice(offer.price, destinationShipping.status === 'free' ? 0 : destinationShipping.cost)
+  const suggestedRetailPrice = offer.price
+    ? recommendRetailPrice(offer.price, sameCurrencyShipping && destinationShipping.status === 'paid' ? destinationShipping.cost : 0)
     : null;
   const missingSignals = [];
   if (!offer.price) missingSignals.push('Supplier unit price');
@@ -787,6 +786,23 @@ export function createDropshipRouter({
     catch (error) { res.status(500).json({ success: false, error: error.message }); }
   });
 
+  router.delete('/research/:id', async (req, res) => {
+    try {
+      let removed;
+      if (dbReady()) {
+        removed = await Research.findByIdAndDelete(req.params.id);
+      } else {
+        const index = memory.research.findIndex(item => String(item._id) === String(req.params.id));
+        if (index >= 0) removed = memory.research.splice(index, 1)[0];
+      }
+      if (!removed) return res.status(404).json({ success: false, error: 'Research candidate not found.' });
+      await writeActivity('research_deleted', `Removed research candidate: ${removed.productName}`, safeUser(req), removed._id);
+      res.json({ success: true, data: { id: String(removed._id) } });
+    } catch (error) {
+      res.status(500).json({ success: false, error: `Could not remove this research candidate: ${error.message}` });
+    }
+  });
+
   router.post('/research/extract', async (req, res) => {
     const rawUrl = clean(req.body.url);
     const destination = clean(req.body.destinationCountry);
@@ -841,8 +857,9 @@ export function createDropshipRouter({
     if (input.retailPrice !== null && (!Number.isFinite(input.retailPrice) || input.retailPrice <= 0)) return res.status(400).json({ success: false, error: 'Retail price must be a positive amount or left blank until costs are confirmed.' });
     if (input.availableStock !== null && (!Number.isInteger(input.availableStock) || input.availableStock < 0)) return res.status(400).json({ success: false, error: 'Available stock must be a whole number or left blank when unknown.' });
     if (input.shippingDays != null && (!Number.isFinite(input.shippingDays) || input.shippingDays < 0)) return res.status(400).json({ success: false, error: 'Shipping days must be zero or greater.' });
-    if (input.retailPrice === null && input.unitCost !== null && (input.shippingStatus === 'free' || input.shippingStatus === 'paid')) {
-      input.retailPrice = recommendRetailPrice(input.unitCost, input.shippingStatus === 'free' ? 0 : input.shippingCost);
+    if (input.unitCost !== null) {
+      const shippingForPrice = input.shippingStatus === 'free' ? 0 : input.shippingStatus === 'paid' ? input.shippingCost : 0;
+      input.retailPrice = recommendRetailPrice(input.unitCost, shippingForPrice);
     }
     Object.assign(input, scoreCandidate(input));
     try {
@@ -879,6 +896,16 @@ export function createDropshipRouter({
       if (!candidate) return res.status(404).json({ success: false, error: 'Research candidate not found.' });
       if (!clean(candidate.productName) || !clean(candidate.category)) return res.status(422).json({ success: false, error: 'Set a product name and select a product category before creating its draft.' });
       const product = toProduct(candidate);
+      if (Number.isFinite(Number(candidate.unitCost)) && Number(candidate.unitCost) > 0) {
+        const shippingForPrice = candidate.shippingStatus === 'free' ? 0
+          : candidate.shippingStatus === 'paid' && Number.isFinite(Number(candidate.shippingCost)) ? Number(candidate.shippingCost)
+            : 0;
+        const recommended = recommendRetailPrice(Number(candidate.unitCost), shippingForPrice);
+        if (recommended !== null) {
+          product.price = recommended;
+          product.originalPrice = recommended;
+        }
+      }
       const duplicate = await findProduct(product.sku, product.name);
       if (duplicate && !req.body.updateExisting) return res.status(409).json({ success: false, duplicate: { id: duplicate.id, name: duplicate.name, status: duplicate.status }, error: 'A matching product already exists. Review it in Admin > Products before choosing an update.' });
       if (duplicate && req.body.updateExisting && duplicate.status !== 'Draft') return res.status(409).json({ success: false, duplicate: { id: duplicate.id, name: duplicate.name, status: duplicate.status || 'Active' }, error: 'Research imports can update drafts only. Edit a live product directly in Admin > Products.' });
@@ -978,3 +1005,4 @@ export function createDropshipRouter({
 
   return router;
 }
+
