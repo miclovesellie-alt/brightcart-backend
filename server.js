@@ -36,8 +36,9 @@ const DEFAULT_STORE_SETTINGS = {
 
 // Middlewares
 app.use(helmet());
-const allowedOrigins = process.env.CORS_ORIGIN
-  ? process.env.CORS_ORIGIN.split(',').map(origin => origin.trim()).filter(Boolean)
+const configuredOrigins = String(process.env.CORS_ORIGIN || '').split(',').map(origin => origin.trim()).filter(origin => origin && origin !== '*');
+const allowedOrigins = configuredOrigins.length
+  ? configuredOrigins
   : ['https://shoppercart.uhcacadamy.com', 'https://brightcart-nine.vercel.app'];
 if (!isProduction) allowedOrigins.push('http://localhost:5173', 'http://127.0.0.1:5173');
 const uniqueAllowedOrigins = [...new Set(allowedOrigins)].filter(origin => {
