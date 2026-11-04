@@ -1,6 +1,7 @@
 import express from 'express';
 import mongoose from 'mongoose';
 import crypto from 'node:crypto';
+import https from 'node:https';
 import { lookup } from 'node:dns/promises';
 import { isIP } from 'node:net';
 
@@ -297,47 +298,77 @@ async function validateProductPageUrl(raw) {
     else addresses = await lookup(url.hostname, { all: true, verbatim: true });
   } catch { throw new Error('The supplier URL host could not be resolved.'); }
   if (!addresses.length || addresses.some(item => !isPublicAddress(item.address))) throw new Error('The supplier URL must resolve only to public internet addresses.');
-  return url;
+  return { url, addresses };
 }
 
-async function readLimitedBody(response) {
-  if (!response.body) return '';
-  const reader = response.body.getReader();
-  const chunks = [];
-  let total = 0;
-  while (true) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    total += value.byteLength;
-    if (total > MAX_PRODUCT_PAGE_BYTES) {
-      await reader.cancel();
-      throw new Error('The supplier page is larger than the importer limit.');
-    }
-    chunks.push(Buffer.from(value));
-  }
-  return Buffer.concat(chunks).toString('utf8');
+function fetchPinnedProductPage(url, addresses) {
+  return new Promise((resolve, reject) => {
+    const pinned = addresses[0];
+    const request = https.request(url, {
+      method: 'GET',
+      servername: url.hostname,
+      timeout: 12_000,
+      lookup: (_hostname, options, callback) => {
+        if (options?.all) return callback(null, [{ address: pinned.address, family: pinned.family || isIP(pinned.address) }]);
+        return callback(null, pinned.address, pinned.family || isIP(pinned.address));
+      },
+      headers: { 'User-Agent': 'BrightcartProductResearch/1.0', Accept: 'text/html,application/xhtml+xml' },
+    }, response => {
+      const status = Number(response.statusCode || 0);
+      const contentType = String(response.headers['content-type'] || '').toLowerCase();
+      if ([301, 302, 303, 307, 308].includes(status)) {
+        response.resume();
+        response.once('end', () => resolve({ status, headers: response.headers, html: '' }));
+        response.once('error', reject);
+        return;
+      }
+      if (!contentType.includes('text/html') && !contentType.includes('application/xhtml+xml')) {
+        response.resume();
+        response.once('end', () => resolve({ status, headers: response.headers, html: '' }));
+        response.once('error', reject);
+        return;
+      }
+      const declaredLength = Number(response.headers['content-length'] || 0);
+      if (declaredLength > MAX_PRODUCT_PAGE_BYTES) {
+        response.destroy(new Error('The supplier page is larger than the importer limit.'));
+        reject(new Error('The supplier page is larger than the importer limit.'));
+        return;
+      }
+      const chunks = [];
+      let total = 0;
+      response.on('data', chunk => {
+        total += chunk.length;
+        if (total > MAX_PRODUCT_PAGE_BYTES) {
+          response.destroy(new Error('The supplier page is larger than the importer limit.'));
+          return;
+        }
+        chunks.push(chunk);
+      });
+      response.once('end', () => resolve({ status, headers: response.headers, html: Buffer.concat(chunks).toString('utf8') }));
+      response.once('error', reject);
+    });
+    request.once('timeout', () => request.destroy(new Error('The supplier page request timed out.')));
+    request.once('error', reject);
+    request.end();
+  });
 }
 
 async function fetchProductPage(raw) {
-  let url = await validateProductPageUrl(raw);
+  let { url, addresses } = await validateProductPageUrl(raw);
   for (let redirects = 0; redirects <= MAX_PRODUCT_PAGE_REDIRECTS; redirects += 1) {
-    const response = await fetch(url, {
-      redirect: 'manual',
-      headers: { 'User-Agent': 'BrightcartProductResearch/1.0', Accept: 'text/html,application/xhtml+xml' },
-      signal: AbortSignal.timeout(12000),
-    });
+    const response = await fetchPinnedProductPage(url, addresses);
     if ([301, 302, 303, 307, 308].includes(response.status)) {
-      const location = response.headers.get('location');
+      const location = response.headers.location;
       if (!location || redirects === MAX_PRODUCT_PAGE_REDIRECTS) throw new Error('The supplier page redirected too many times.');
-      url = await validateProductPageUrl(new URL(location, url).toString());
+      ({ url, addresses } = await validateProductPageUrl(new URL(location, url).toString()));
       continue;
     }
-    if (!response.ok) throw new Error(`Supplier page returned HTTP ${response.status}.`);
-    const type = (response.headers.get('content-type') || '').toLowerCase();
+    if (response.status < 200 || response.status >= 300) throw new Error(`Supplier page returned HTTP ${response.status}.`);
+    const type = String(response.headers['content-type'] || '').toLowerCase();
     if (!type.includes('text/html') && !type.includes('application/xhtml+xml')) throw new Error('The supplier URL did not return a readable HTML product page.');
-    const declaredLength = Number(response.headers.get('content-length') || 0);
+    const declaredLength = Number(response.headers['content-length'] || 0);
     if (declaredLength > MAX_PRODUCT_PAGE_BYTES) throw new Error('The supplier page is larger than the importer limit.');
-    return { html: await readLimitedBody(response), finalUrl: url.toString() };
+    return { html: response.html, finalUrl: url.toString() };
   }
   throw new Error('Could not follow the supplier page redirect.');
 }
@@ -689,6 +720,7 @@ export function createDropshipRouter({
   authenticate,
   requireAdmin,
   requirePublisher,
+  rateLimit,
   getAllProducts,
   getAllOrders,
   saveProduct,
@@ -697,6 +729,8 @@ export function createDropshipRouter({
   findOrder,
 }) {
   const router = express.Router();
+  const extractRateLimit = rateLimit({ windowMs: 10 * 60_000, max: 12, keyPrefix: 'dropship-extract' });
+  const generateRateLimit = rateLimit({ windowMs: 10 * 60_000, max: 20, keyPrefix: 'dropship-ai' });
   router.use(authenticate, requireAdmin);
 
   router.get('/connections', async (_req, res) => {
@@ -805,12 +839,11 @@ export function createDropshipRouter({
     }
   });
 
-  router.post('/research/extract', async (req, res) => {
+  router.post('/research/extract', extractRateLimit, async (req, res) => {
     const rawUrl = clean(req.body.url);
     const destination = clean(req.body.destinationCountry);
     try {
-      const source = await validateProductPageUrl(rawUrl);
-      const { html, finalUrl } = await fetchProductPage(source.toString());
+      const { html, finalUrl } = await fetchProductPage(rawUrl);
       const extracted = parseProductHtml(html, finalUrl, destination);
       if (!extracted.productName) return res.status(422).json({ success: false, error: 'The page does not expose a product name. Enter product facts manually or use another source page.' });
       res.json({
@@ -873,7 +906,7 @@ export function createDropshipRouter({
     }
   });
 
-  router.post('/research/:id/generate-content', async (req, res) => {
+  router.post('/research/:id/generate-content', generateRateLimit, async (req, res) => {
     try {
       const candidate = dbReady() ? await Research.findById(req.params.id) : memory.research.find(item => String(item._id) === req.params.id);
       if (!candidate) return res.status(404).json({ success: false, error: 'Research candidate not found.' });

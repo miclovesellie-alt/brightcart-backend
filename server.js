@@ -7,6 +7,7 @@ import dotenv from 'dotenv';
 import crypto from 'crypto';
 import jwt from 'jsonwebtoken';
 import { createDropshipRouter } from './dropship.js';
+import { rateLimit } from './security.js';
 
 dotenv.config();
 
@@ -14,10 +15,17 @@ const app = express();
 const PORT = process.env.PORT || 5000;
 const MONGODB_URI = process.env.MONGODB_URI;
 const JWT_SECRET = process.env.JWT_SECRET;
+const isProduction = process.env.NODE_ENV === 'production';
 const LEGACY_SALT = 'brightcart_secure_salt_v1_2026';
 const memoryUsers = new Map();
 const memoryOrders = [];
 const loginFailures = new Map();
+const memoryCheckoutRequests = new Map();
+const loginFailureCleanup = setInterval(() => {
+  const expiry = Date.now() - 24 * 60 * 60_000;
+  for (const [key, item] of loginFailures) if (Number(item.lastAttemptAt || 0) < expiry) loginFailures.delete(key);
+}, 60 * 60_000);
+loginFailureCleanup.unref?.();
 const DEFAULT_STORE_SETTINGS = {
   supportEmail: '',
   whatsappNumber: '',
@@ -30,10 +38,43 @@ const DEFAULT_STORE_SETTINGS = {
 app.use(helmet());
 const allowedOrigins = process.env.CORS_ORIGIN
   ? process.env.CORS_ORIGIN.split(',').map(origin => origin.trim()).filter(Boolean)
-  : '*';
-app.use(cors({ origin: allowedOrigins }));
+  : ['https://shoppercart.uhcacadamy.com', 'https://brightcart-nine.vercel.app'];
+if (!isProduction) allowedOrigins.push('http://localhost:5173', 'http://127.0.0.1:5173');
+const uniqueAllowedOrigins = [...new Set(allowedOrigins)].filter(origin => {
+  try {
+    const parsed = new URL(origin);
+    if (parsed.origin !== origin) return false;
+    if (isProduction && (parsed.protocol !== 'https:' || ['localhost', '127.0.0.1', '::1'].includes(parsed.hostname))) return false;
+    return ['http:', 'https:'].includes(parsed.protocol);
+  } catch { return false; }
+});
+const trustProxyHops = Number.parseInt(process.env.TRUST_PROXY_HOPS || (isProduction ? '1' : '0'), 10);
+app.set('trust proxy', Number.isInteger(trustProxyHops) && trustProxyHops >= 0 ? trustProxyHops : 0);
+app.use(cors({
+  origin(origin, callback) {
+    if (!origin || uniqueAllowedOrigins.includes(origin)) return callback(null, true);
+    return callback(Object.assign(new Error('Origin is not allowed.'), { status: 403 }));
+  },
+  methods: ['GET', 'POST', 'PATCH', 'DELETE', 'OPTIONS'],
+  allowedHeaders: ['Authorization', 'Content-Type'],
+  credentials: false,
+  maxAge: 600,
+}));
 app.use(express.json({ limit: '1mb', verify: (req, _res, buffer) => { req.rawBody = buffer; } }));
+app.use((req, res, next) => {
+  if (isProduction && req.path !== '/api/health' && mongoose.connection.readyState !== 1) {
+    return res.status(503).json({ success: false, error: 'Store database is temporarily unavailable. Please retry shortly.' });
+  }
+  next();
+});
 app.use(morgan('dev'));
+
+const loginRateLimit = rateLimit({ windowMs: 15 * 60_000, max: 10, keyPrefix: 'login', message: 'Too many sign-in attempts. Try again later.' });
+const registerRateLimit = rateLimit({ windowMs: 60 * 60_000, max: 8, keyPrefix: 'register', message: 'Too many account creation attempts. Try again later.' });
+const orderRateLimit = rateLimit({ windowMs: 15 * 60_000, max: 20, keyPrefix: 'order-create' });
+const paymentInitRateLimit = rateLimit({ windowMs: 15 * 60_000, max: 10, keyPrefix: 'payment-init' });
+const paymentVerifyRateLimit = rateLimit({ windowMs: 15 * 60_000, max: 30, keyPrefix: 'payment-verify' });
+const testEmailRateLimit = rateLimit({ windowMs: 60 * 60_000, max: 3, keyPrefix: 'test-email', message: 'Too many test emails were requested. Try again later.' });
 
 // MongoDB Schemas & Models
 const productSchema = new mongoose.Schema({
@@ -67,6 +108,7 @@ const productSchema = new mongoose.Schema({
 
 const orderSchema = new mongoose.Schema({
   id: { type: String, required: true, unique: true },
+  customerUserId: String,
   customer: { type: String, required: true },
   email: String,
   phone: String,
@@ -85,10 +127,14 @@ const orderSchema = new mongoose.Schema({
   supplier: String,
   tracking: String,
   trackingUrl: String,
-  paymentStatus: { type: String, enum: ['unpaid', 'pending_verification', 'paid', 'cancelled', 'refunded'], default: 'unpaid' },
+  paymentStatus: { type: String, enum: ['unpaid', 'pending_verification', 'paid', 'cancelled', 'partially_refunded', 'refunded'], default: 'unpaid' },
   paymentReference: String,
   paymentCurrency: String,
   paymentAmount: Number,
+  paymentRefundedAmount: Number,
+  paymentRefundIds: { type: [String], default: [] },
+  checkoutRequestId: String,
+  paymentAuthorizationUrl: String,
   paymentVerification: String,
   paymentVerifiedBy: String,
   paymentVerifiedAt: Date,
@@ -96,6 +142,8 @@ const orderSchema = new mongoose.Schema({
   supplierPurchaseId: String,
   supplierSpend: Number,
 }, { timestamps: true });
+orderSchema.index({ paymentReference: 1 }, { unique: true, partialFilterExpression: { paymentReference: { $type: 'string' } } });
+orderSchema.index({ checkoutRequestId: 1 }, { unique: true, partialFilterExpression: { checkoutRequestId: { $type: 'string' } } });
 
 const userSchema = new mongoose.Schema({
   name: { type: String, required: true },
@@ -200,17 +248,16 @@ function signSession(user) {
 async function bootstrapSuperAdmin() {
   const email = String(process.env.SUPER_ADMIN_EMAIL || '').trim().toLowerCase();
   const password = process.env.SUPER_ADMIN_PASSWORD || '';
-  if (!email || password.length < 12) {
+  if (!email || email.length > 254 || password.length < 12 || password.length > 256) {
     console.warn('⚠️ Super admin bootstrap skipped. Set SUPER_ADMIN_EMAIL and a 12+ character SUPER_ADMIN_PASSWORD.');
     return;
   }
   const passwordHash = await hashPassword(password);
   const userData = { name: 'Super Admin', email, role: 'super_admin', passwordHash, status: 'Active' };
   if (mongoose.connection.readyState === 1) {
-    await User.findOneAndUpdate({ email }, { $set: userData }, { upsert: true, new: true, setDefaultsOnInsert: true });
+    if (!(await User.exists({ email }))) await User.create(userData);
   } else {
-    const old = memoryUsers.get(email);
-    memoryUsers.set(email, { ...userData, id: old?.id || crypto.randomUUID() });
+    if (!memoryUsers.has(email)) memoryUsers.set(email, { ...userData, id: crypto.randomUUID() });
   }
   console.log(`✅ Super admin configured for ${email}.`);
 }
@@ -250,6 +297,22 @@ function authenticate(req, res, next) {
   }).catch(next);
 }
 
+function optionalAuthenticate(req, res, next) {
+  const header = req.headers.authorization || '';
+  if (!header) return next();
+  const match = header.match(/^Bearer\s+(.+)$/i);
+  if (!match) return res.status(401).json({ success: false, error: 'Session is invalid. Sign in again.' });
+  if (!JWT_SECRET || JWT_SECRET.length < 32) return res.status(503).json({ success: false, error: 'Authentication is unavailable until JWT_SECRET is configured.' });
+  let claims;
+  try { claims = jwt.verify(match[1], JWT_SECRET); }
+  catch { return res.status(401).json({ success: false, error: 'Session is invalid or expired. Sign in again.' }); }
+  findUserById(claims.sub).then(user => {
+    if (!user || user.status !== 'Active') return res.status(401).json({ success: false, error: 'Account is unavailable. Sign in again.' });
+    req.user = user;
+    next();
+  }).catch(next);
+}
+
 function requireRoles(...roles) {
   return (req, res, next) => {
     if (!req.user || !roles.includes(req.user.role)) return res.status(403).json({ success: false, error: 'Your account role cannot perform this action.' });
@@ -273,8 +336,10 @@ function getLoginLock(key) {
 }
 
 function recordLoginFailure(key) {
+  if (!loginFailures.has(key) && loginFailures.size >= 50_000) loginFailures.delete(loginFailures.keys().next().value);
   const item = loginFailures.get(key) || { attempts: 0, lockedUntil: 0, lockouts: 0 };
   item.attempts += 1;
+  item.lastAttemptAt = Date.now();
   if (item.attempts >= 5) {
     item.lockouts += 1;
     item.lockedUntil = Date.now() + Math.min(30_000 * (2 ** (item.lockouts - 1)), 30 * 60_000);
@@ -287,6 +352,7 @@ function recordLoginFailure(key) {
 // Database Connection & Catalog Cleanup
 async function connectDB() {
   if (!MONGODB_URI) {
+    if (isProduction) throw new Error('MONGODB_URI is required in production; refusing to start with volatile in-memory storage.');
     console.warn('⚠️ MONGODB_URI not provided. Running with in-memory store.');
     await bootstrapSuperAdmin();
     return;
@@ -307,6 +373,7 @@ async function connectDB() {
     await bootstrapSuperAdmin();
   } catch (err) {
     console.error('❌ MongoDB Connection Error:', err.message);
+    if (isProduction) throw err;
   }
 }
 
@@ -344,8 +411,8 @@ async function findProduct(sku, name, id) {
 }
 
 async function getAllOrders() {
-  if (mongoose.connection.readyState === 1) return Order.find().sort({ createdAt: -1 }).lean();
-  return memoryOrders;
+  if (mongoose.connection.readyState === 1) return Order.find().select('-paymentAuthorizationUrl -checkoutRequestId').sort({ createdAt: -1 }).lean();
+  return memoryOrders.map(({ paymentAuthorizationUrl: _paymentAuthorizationUrl, checkoutRequestId: _checkoutRequestId, ...order }) => order);
 }
 
 async function findOrder(id) {
@@ -361,6 +428,13 @@ async function findOrderByPaymentReference(reference) {
   return memoryOrders.find(order => String(order.paymentReference || '') === normalized) || null;
 }
 
+async function findOrderByCheckoutRequestId(checkoutRequestId) {
+  const normalized = String(checkoutRequestId || '').trim();
+  if (!normalized) return null;
+  if (mongoose.connection.readyState === 1) return Order.findOne({ checkoutRequestId: normalized });
+  return memoryCheckoutRequests.get(normalized) || null;
+}
+
 async function saveOrder(order) {
   if (mongoose.connection.readyState === 1) {
     const found = await Order.findOne({ id: String(order.id) });
@@ -371,6 +445,7 @@ async function saveOrder(order) {
   const index = memoryOrders.findIndex(existing => String(existing.id) === String(order.id));
   if (index < 0) memoryOrders.unshift(order);
   else memoryOrders[index] = order;
+  if (order.checkoutRequestId) memoryCheckoutRequests.set(String(order.checkoutRequestId), order);
   return order;
 }
 
@@ -486,6 +561,51 @@ async function sendTransactionalEmail({ to, subject, text, html }) {
 
 const PAYSTACK_CURRENCIES = new Set(['GHS', 'NGN', 'USD', 'ZAR', 'KES']);
 let paystackRatesCache = { fetchedAt: 0, rates: null };
+const PAYMENT_WEBHOOK_TOLERANCE_SECONDS = 300;
+
+function timingSafeHexMatch(expected, provided) {
+  if (!/^[0-9a-f]{128}$/i.test(String(provided || ''))) return false;
+  const expectedBuffer = Buffer.isBuffer(expected) ? expected : Buffer.from(expected, 'hex');
+  const providedBuffer = Buffer.from(provided, 'hex');
+  return expectedBuffer.length === providedBuffer.length && crypto.timingSafeEqual(expectedBuffer, providedBuffer);
+}
+
+function isValidPaystackWebhook(req) {
+  if (!Buffer.isBuffer(req.rawBody)) return false;
+  const webhookSignature = String(req.get('paystack-signature') || '');
+  const webhookSecrets = [process.env.PAYSTACK_WEBHOOK_SECRET, process.env.PAYSTACK_WEBHOOK_SECRET_PREVIOUS]
+    .map(value => String(value || '').trim()).filter(Boolean);
+  if (webhookSignature && webhookSecrets.length) {
+    let timestamp = null;
+    const signatures = [];
+    for (const part of webhookSignature.split(',')) {
+      const separator = part.indexOf('=');
+      if (separator < 0) continue;
+      const key = part.slice(0, separator).trim();
+      const value = part.slice(separator + 1).trim();
+      if (key === 't') {
+        if (timestamp !== null || !/^\d+$/.test(value)) return false;
+        timestamp = Number(value);
+      } else if (key === 'v1') {
+        const colon = value.indexOf(':');
+        if (colon > 0) signatures.push(value.slice(colon + 1));
+      }
+    }
+    const now = Math.floor(Date.now() / 1000);
+    if (!Number.isSafeInteger(timestamp) || !signatures.length || Math.abs(now - timestamp) > PAYMENT_WEBHOOK_TOLERANCE_SECONDS) return false;
+    for (const secret of webhookSecrets) {
+      const expected = crypto.createHmac('sha512', secret).update(`${timestamp}.`).update(req.rawBody).digest();
+      if (signatures.some(signature => timingSafeHexMatch(expected, signature))) return true;
+    }
+    return false;
+  }
+
+  const legacySecret = String(process.env.PAYSTACK_SECRET_KEY || '').trim();
+  const legacySignature = String(req.get('x-paystack-signature') || '');
+  if (!legacySecret || !legacySignature) return false;
+  const expected = crypto.createHmac('sha512', legacySecret).update(req.rawBody).digest();
+  return timingSafeHexMatch(expected, legacySignature);
+}
 
 async function getPaystackRate(currency) {
   if (currency === 'USD') return 1;
@@ -524,11 +644,14 @@ async function checkPaystackPayment(order) {
   const transactionEmail = String(transaction.customer?.email || '').trim().toLowerCase();
   if (transactionEmail && transactionEmail !== String(order.email || '').trim().toLowerCase()) return { verified: false, error: 'The Paystack payer email does not match the order.' };
 
-  let rate;
-  try { rate = await getPaystackRate(currency); }
-  catch (error) { return { verified: false, error: `Could not confirm the currency conversion: ${error.message}` }; }
-  if (!rate) return { verified: false, error: 'Could not determine the expected payment amount for this currency.' };
-  const expectedAmount = Math.round(Number(order.total || 0) * rate * 100);
+  let expectedAmount = Number(order.paymentAmount);
+  if (!Number.isSafeInteger(expectedAmount) || expectedAmount < 1) {
+    let rate;
+    try { rate = await getPaystackRate(currency); }
+    catch (error) { return { verified: false, error: `Could not confirm the currency conversion: ${error.message}` }; }
+    if (!rate) return { verified: false, error: 'Could not determine the expected payment amount for this currency.' };
+    expectedAmount = Math.round(Number(order.total || 0) * rate * 100);
+  }
   if (!Number.isFinite(expectedAmount) || Number(transaction.amount) !== expectedAmount) {
     return { verified: false, error: 'The amount paid does not match the current order total.' };
   }
@@ -593,10 +716,11 @@ async function notifyOrderStatusChanged(order) {
 
 // API Routes
 app.get('/api/health', (_req, res) => {
-  res.json({
-    status: 'ok',
+  const databaseConnected = mongoose.connection.readyState === 1;
+  res.status(isProduction && !databaseConnected ? 503 : 200).json({
+    status: databaseConnected ? 'ok' : (isProduction ? 'degraded' : 'ok'),
     name: 'Store API',
-    database: mongoose.connection.readyState === 1 ? 'connected' : 'memory-only',
+    database: databaseConnected ? 'connected' : (isProduction ? 'unavailable' : 'memory-only'),
     authenticationConfigured: Boolean(JWT_SECRET && JWT_SECRET.length >= 32),
     timestamp: new Date().toISOString(),
   });
@@ -610,11 +734,12 @@ app.get('/api/store-settings', async (_req, res) => {
   catch (error) { res.status(500).json({ success: false, error: error.message }); }
 });
 
-app.post('/api/auth/register', async (req, res) => {
+app.post('/api/auth/register', registerRateLimit, async (req, res) => {
   const name = String(req.body.name || '').trim();
   const email = String(req.body.email || '').trim().toLowerCase();
   const password = String(req.body.password || '');
-  if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email) || !name || name.length > 100 || password.length < 10) {
+  if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email) || email.length > 254 || !name || name.length > 100 || password.length < 10 || password.length > 256
+    || String(req.body.phone || '').length > 40 || String(req.body.country || '').length > 100) {
     return res.status(400).json({ success: false, error: 'Enter a valid email and name, and use a password of at least 10 characters.' });
   }
   if (!JWT_SECRET || JWT_SECRET.length < 32) return res.status(503).json({ success: false, error: 'Authentication is not configured. Set a strong JWT_SECRET on the server.' });
@@ -642,10 +767,10 @@ app.post('/api/auth/register', async (req, res) => {
   }
 });
 
-app.post('/api/auth/login', async (req, res) => {
+app.post('/api/auth/login', loginRateLimit, async (req, res) => {
   const email = String(req.body.email || '').trim().toLowerCase();
   const password = String(req.body.password || '');
-  if (!email || !password) return res.status(400).json({ success: false, error: 'Email and password are required.' });
+  if (!email || email.length > 254 || !password || password.length > 256) return res.status(400).json({ success: false, error: 'Enter a valid email and password.' });
   if (!JWT_SECRET || JWT_SECRET.length < 32) return res.status(503).json({ success: false, error: 'Authentication is not configured. Set a strong JWT_SECRET on the server.' });
   const attemptKey = loginAttemptKey(req, email);
   const waitSeconds = getLoginLock(attemptKey);
@@ -716,7 +841,7 @@ app.patch('/api/admin/store-settings', authenticate, storeSettingsAdmin, async (
   } catch (error) { res.status(400).json({ success: false, error: error.message }); }
 });
 
-app.post('/api/admin/store-settings/test-email', authenticate, storeSettingsAdmin, async (_req, res) => {
+app.post('/api/admin/store-settings/test-email', authenticate, storeSettingsAdmin, testEmailRateLimit, async (_req, res) => {
   const emailStatus = emailProviderStatus();
   if (!emailStatus.configured) return res.status(503).json({ success: false, error: 'Email is not configured. Add RESEND_API_KEY and EMAIL_FROM to the backend environment.' });
   try {
@@ -791,147 +916,246 @@ app.delete('/api/admin/products/:id', authenticate, editorRoles, async (req, res
   } catch (error) { res.status(500).json({ success: false, error: error.message }); }
 });
 
-async function createOrder(req, res) {
-  try {
-    const customer = String(req.body.customer || req.body.name || '').trim();
-    const email = String(req.body.email || '').trim().toLowerCase();
-    const incomingItems = Array.isArray(req.body.items) ? req.body.items : [];
-    if (!customer || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email) || incomingItems.length === 0) {
-      return res.status(400).json({ success: false, error: 'Customer name, valid email, and at least one product are required.' });
-    }
-    const paystack = String(req.body.paymentMethod || '').toLowerCase().includes('paystack');
-    const paymentReference = paystack ? String(req.body.paymentRef || '').trim() : '';
-    const paymentCurrency = paystack ? String(req.body.paymentCurrency || '').trim().toUpperCase() : '';
-    if (paystack && !paymentReference) return res.status(400).json({ success: false, error: 'The Paystack transaction reference is required.' });
-    if (paystack && !PAYSTACK_CURRENCIES.has(paymentCurrency)) return res.status(400).json({ success: false, error: 'This Paystack currency is not supported for server verification.' });
-    if (paystack) {
-      const existing = await findOrderByPaymentReference(paymentReference);
-      if (existing) {
-        if (String(existing.email || '').toLowerCase() !== email) {
-          return res.status(409).json({ success: false, error: 'This Paystack reference is already attached to another order.' });
-        }
-        if (existing.paymentStatus !== 'paid') {
-          try {
-            const verification = await checkPaystackPayment(existing);
-            if (verification.verified) {
-              existing.paymentAmount = Number(verification.amount);
-              await markOrderPaymentVerified(existing, 'server', false);
-            }
-          } catch (error) { console.error('Paystack verification could not be completed:', error.message); }
-        }
-        const saved = await findOrder(existing.id) || existing;
-        return res.json({
-          success: true,
-          data: { id: saved.id, status: saved.status, paymentStatus: saved.paymentStatus, paymentReference: saved.paymentReference, total: saved.total },
-          paymentStatus: saved.paymentStatus,
-        });
-      }
-    }
-    const catalog = await getAllProducts();
-    const items = [];
-    for (const incoming of incomingItems) {
-      const productId = incoming.product?.id ?? incoming.productId;
-      const product = catalog.find(item =>
-        String(item.id) === String(productId)
-        && !isSampleProduct(item)
-        && item.status !== 'Draft'
-        && item.status !== 'Out of Stock'
-      );
-      const qty = Number(incoming.qty || 1);
-      if (!product || !Number.isInteger(qty) || qty < 1 || qty > 99) return res.status(400).json({ success: false, error: 'A product is unavailable or has an invalid quantity. Refresh the cart and try again.' });
-      const storedProduct = product.toObject ? product.toObject() : product;
-      const requestedVariant = incoming.variant && typeof incoming.variant === 'object' ? incoming.variant : null;
-      let chosenVariant = null;
-      if (requestedVariant) {
-        const variantKey = String(requestedVariant.id || requestedVariant.color || requestedVariant.name || '').trim().toLowerCase();
-        const variants = Array.isArray(storedProduct.variants) ? storedProduct.variants : [];
-        chosenVariant = variants.find(variant =>
-          String(variant?.id || variant?.color || variant?.name || '').trim().toLowerCase() === variantKey
-          || (variant?.color && String(variant.color).trim().toLowerCase() === variantKey)
-          || (variant?.name && String(variant.name).trim().toLowerCase() === variantKey)
-        );
-        if (!chosenVariant) return res.status(400).json({ success: false, error: 'The selected product color is no longer available. Refresh the product and try again.' });
-        if (chosenVariant.stock != null && Number.isInteger(Number(chosenVariant.stock)) && Number(chosenVariant.stock) >= 0 && qty > Number(chosenVariant.stock)) {
-          return res.status(409).json({ success: false, error: 'The selected color does not have enough stock.' });
-        }
-      }
-      const { cost, supplier, supplierDetails, verifiedFacts, policyReviewed, inventoryVerified, ...safeProductBase } = storedProduct;
-      const safeVariant = chosenVariant ? {
-        id: String(chosenVariant.id || chosenVariant.color || chosenVariant.name || ''),
-        name: String(chosenVariant.name || chosenVariant.color || ''),
-        color: String(chosenVariant.color || chosenVariant.name || ''),
-        image: String(chosenVariant.image || chosenVariant.imageUrl || ''),
-        images: Array.isArray(chosenVariant.images) ? chosenVariant.images.filter(value => typeof value === 'string').slice(0, 20) : [],
-        sku: String(chosenVariant.sku || ''),
-      } : null;
-      const safeProduct = safeVariant ? {
-        ...safeProductBase,
-        image: safeVariant.image || safeProductBase.image,
-        images: safeVariant.images.length ? safeVariant.images : safeProductBase.images,
-      } : safeProductBase;
-      const supplierUnitCost = supplierDetails?.unitCost ?? cost;
-      const shippingStatus = supplierDetails?.shippingStatus;
-      const supplierShippingCost = shippingStatus === 'free'
-        ? 0
-        : shippingStatus === 'paid' && supplierDetails?.shippingCost !== null && supplierDetails?.shippingCost !== undefined && supplierDetails?.shippingCost !== '' && Number.isFinite(Number(supplierDetails.shippingCost))
-          ? Number(supplierDetails.shippingCost)
-          : null;
-      const supplierCost = supplierUnitCost !== null && supplierUnitCost !== undefined && supplierUnitCost !== ''
-        && Number.isFinite(Number(supplierUnitCost)) && supplierShippingCost !== null
-        ? Number(supplierUnitCost) + supplierShippingCost
-        : null;
-      items.push({ product: safeProduct, variant: safeVariant, qty, supplierCost, supplierName: product.supplier || null });
-    }
-    const subtotal = items.reduce((sum, item) => sum + Number(item.product.price) * item.qty, 0);
-    const shipping = subtotal > 50 ? 0 : 4.99;
-    const tax = subtotal * 0.08;
-    const order = {
-      id: `ORD-${Date.now()}-${crypto.randomBytes(2).toString('hex')}`,
-      customer,
-      email,
-      phone: String(req.body.phone || '').trim(),
-      country: String(req.body.country || '').trim(),
-      address: String(req.body.address || '').trim(),
-      city: String(req.body.city || '').trim(),
-      state: String(req.body.state || '').trim(),
-      date: new Date().toISOString(),
-      items,
-      subtotal,
-      shipping,
-      tax,
-      total: subtotal + shipping + tax,
-      status: paystack ? 'Pending payment verification' : 'Pending',
-      paymentStatus: paystack ? 'pending_verification' : 'unpaid',
-      paymentReference: paystack ? paymentReference : undefined,
-      paymentCurrency: paystack ? paymentCurrency : undefined,
-      paymentVerification: paystack ? 'client_callback_unverified' : undefined,
-      paymentMethod: String(req.body.paymentMethod || ''),
-      supplierPurchaseStatus: 'not_started',
-    };
-    let created = await saveOrder(order);
-    if (paystack && String(process.env.PAYSTACK_SECRET_KEY || '').trim()) {
-      try {
-        const verification = await checkPaystackPayment(created);
-        if (verification.verified) {
-          created.paymentAmount = Number(verification.amount);
-          created = await markOrderPaymentVerified(created, 'server', false);
-        } else {
-          created.paymentVerification = 'verification_pending';
-          created = await saveOrder(created);
-          console.info(`Payment for order ${created.id} needs review: ${verification.error}`);
-        }
-      } catch (error) {
-        created.paymentVerification = 'verification_unavailable';
-        created = await saveOrder(created);
-        console.error(`Could not verify payment for order ${created.id}:`, error.message);
-      }
-    }
-    void notifyOrderCreated(created).catch(error => console.error('Could not prepare order notification:', error.message));
-    res.status(201).json({ success: true, data: created, paymentStatus: created.paymentStatus });
-  } catch (error) { res.status(500).json({ success: false, error: error.message }); }
+function requestError(status, message) {
+  const error = new Error(message);
+  error.status = status;
+  return error;
 }
 
-app.post('/api/orders', createOrder);
+function checkoutOrderSummary(order) {
+  return {
+    id: order.id,
+    status: order.status,
+    paymentStatus: order.paymentStatus,
+    paymentReference: order.paymentReference || '',
+    paymentRef: order.paymentReference || '',
+    paymentCurrency: order.paymentCurrency || '',
+    total: Number(order.total || 0),
+  };
+}
+
+async function createOrderRecord(input = {}, payment = {}, customerUserId = '') {
+  const customer = String(input.customer || input.name || '').trim();
+  const email = String(input.email || '').trim().toLowerCase();
+  const incomingItems = Array.isArray(input.items) ? input.items : [];
+  if (!customer || customer.length > 100 || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email) || email.length > 254 || incomingItems.length === 0 || incomingItems.length > 50) {
+    throw requestError(400, 'Enter a valid customer name and email, with between 1 and 50 products.');
+  }
+  if (payment.reference && (String(payment.reference).length > 160 || !PAYSTACK_CURRENCIES.has(payment.currency))) {
+    throw requestError(400, 'The Paystack transaction details are invalid.');
+  }
+  const catalog = await getAllProducts();
+  const items = [];
+  const requestedStock = new Map();
+  for (const incoming of incomingItems) {
+    const productId = incoming?.product?.id ?? incoming?.productId;
+    const product = catalog.find(item => String(item.id) === String(productId)
+      && !isSampleProduct(item) && item.status !== 'Draft' && item.status !== 'Out of Stock');
+    const qty = Number(incoming?.qty ?? 1);
+    if (!product || !Number.isInteger(qty) || qty < 1 || qty > 99) {
+      throw requestError(400, 'A product is unavailable or has an invalid quantity. Refresh the cart and try again.');
+    }
+    const storedProduct = product.toObject ? product.toObject() : product;
+    const requestedVariant = incoming?.variant && typeof incoming.variant === 'object' ? incoming.variant : null;
+    let chosenVariant = null;
+    if (requestedVariant) {
+      const variantKey = String(requestedVariant.id || requestedVariant.color || requestedVariant.name || '').trim().toLowerCase();
+      const variants = Array.isArray(storedProduct.variants) ? storedProduct.variants : [];
+      chosenVariant = variants.find(variant =>
+        String(variant?.id || variant?.color || variant?.name || '').trim().toLowerCase() === variantKey
+        || (variant?.color && String(variant.color).trim().toLowerCase() === variantKey)
+        || (variant?.name && String(variant.name).trim().toLowerCase() === variantKey));
+      if (!chosenVariant) throw requestError(400, 'The selected product color is no longer available. Refresh the product and try again.');
+      const variantStock = chosenVariant.stock;
+      if (variantStock != null && Number.isInteger(Number(variantStock)) && Number(variantStock) >= 0) {
+        const stockKey = `${product.id}:${variantKey}`;
+        const requested = (requestedStock.get(stockKey) || 0) + qty;
+        requestedStock.set(stockKey, requested);
+        if (requested > Number(variantStock)) throw requestError(409, 'The selected color does not have enough stock.');
+      }
+    } else if (storedProduct.stock != null && Number.isFinite(Number(storedProduct.stock)) && Number(storedProduct.stock) >= 0) {
+      const stockKey = `${product.id}:default`;
+      const requested = (requestedStock.get(stockKey) || 0) + qty;
+      requestedStock.set(stockKey, requested);
+      if (requested > Number(storedProduct.stock)) throw requestError(409, 'There is not enough stock for this product.');
+    }
+    const { cost, supplier, supplierDetails, verifiedFacts, policyReviewed, inventoryVerified, researchId, ...safeProductBase } = storedProduct;
+    const safeVariant = chosenVariant ? {
+      id: String(chosenVariant.id || chosenVariant.color || chosenVariant.name || ''),
+      name: String(chosenVariant.name || chosenVariant.color || ''),
+      color: String(chosenVariant.color || chosenVariant.name || ''),
+      image: String(chosenVariant.image || chosenVariant.imageUrl || ''),
+      images: Array.isArray(chosenVariant.images) ? chosenVariant.images.filter(value => typeof value === 'string').slice(0, 20) : [],
+      sku: String(chosenVariant.sku || ''),
+    } : null;
+    const safeProduct = safeVariant ? {
+      ...safeProductBase,
+      image: safeVariant.image || safeProductBase.image,
+      images: safeVariant.images.length ? safeVariant.images : safeProductBase.images,
+    } : safeProductBase;
+    const supplierUnitCost = supplierDetails?.unitCost ?? cost;
+    const shippingStatus = supplierDetails?.shippingStatus;
+    const supplierShippingCost = shippingStatus === 'free' ? 0
+      : shippingStatus === 'paid' && supplierDetails?.shippingCost !== null && supplierDetails?.shippingCost !== undefined && supplierDetails?.shippingCost !== '' && Number.isFinite(Number(supplierDetails.shippingCost))
+        ? Number(supplierDetails.shippingCost) : null;
+    const supplierCost = supplierUnitCost !== null && supplierUnitCost !== undefined && supplierUnitCost !== ''
+      && Number.isFinite(Number(supplierUnitCost)) && supplierShippingCost !== null
+      ? Number(supplierUnitCost) + supplierShippingCost : null;
+    items.push({ product: safeProduct, variant: safeVariant, qty, supplierCost, supplierName: product.supplier || null });
+  }
+
+  const subtotal = items.reduce((sum, item) => sum + Number(item.product.price) * item.qty, 0);
+  const shipping = subtotal > 50 ? 0 : 4.99;
+  const tax = subtotal * 0.08;
+  return saveOrder({
+    id: `ORD-${Date.now()}-${crypto.randomBytes(8).toString('hex')}`,
+    customerUserId: customerUserId ? String(customerUserId) : undefined,
+    customer,
+    email,
+    phone: String(input.phone || '').trim().slice(0, 40),
+    country: String(input.country || '').trim().slice(0, 100),
+    address: String(input.address || '').trim().slice(0, 300),
+    city: String(input.city || '').trim().slice(0, 100),
+    state: String(input.state || '').trim().slice(0, 100),
+    date: new Date().toISOString(),
+    items,
+    subtotal,
+    shipping,
+    tax,
+    total: subtotal + shipping + tax,
+    status: payment.reference ? 'Pending payment verification' : 'Pending',
+    paymentStatus: payment.reference ? 'pending_verification' : 'unpaid',
+    paymentReference: payment.reference || undefined,
+    paymentCurrency: payment.currency || undefined,
+    paymentAmount: payment.amount || undefined,
+    paymentVerification: payment.reference ? 'server_initializing' : undefined,
+    paymentMethod: payment.reference ? 'Paystack (MoMo/Card)' : 'Pay on Delivery / Bank Transfer',
+    checkoutRequestId: payment.checkoutRequestId || undefined,
+    supplierPurchaseStatus: 'not_started',
+  });
+}
+
+function storefrontOrigin(req) {
+  const requestOrigin = String(req.get('origin') || '').trim();
+  if (uniqueAllowedOrigins.includes(requestOrigin)) return requestOrigin;
+  const configured = String(process.env.STOREFRONT_URL || '').trim();
+  try {
+    const url = new URL(configured);
+    if (['https:', 'http:'].includes(url.protocol) && (!isProduction || url.protocol === 'https:')) return url.origin;
+  } catch { /* Use the production storefront fallback below. */ }
+  return uniqueAllowedOrigins.find(origin => origin.startsWith('https://')) || 'https://shoppercart.uhcacadamy.com';
+}
+
+async function createOrder(req, res) {
+  if (String(req.body.paymentMethod || '').toLowerCase().includes('paystack')) {
+    return res.status(409).json({ success: false, error: 'Paystack payments must be initialized by the secure checkout endpoint.' });
+  }
+  try {
+    const created = await createOrderRecord(req.body, {}, req.user?._id || req.user?.id);
+    void notifyOrderCreated(created).catch(error => console.error('Could not prepare order notification:', error.message));
+    res.status(201).json({ success: true, data: checkoutOrderSummary(created), paymentStatus: created.paymentStatus });
+  } catch (error) {
+    res.status(error.status || 500).json({ success: false, error: error.status ? error.message : 'Could not create this order.' });
+  }
+}
+
+app.post('/api/orders', orderRateLimit, optionalAuthenticate, createOrder);
+
+app.post('/api/payments/paystack/initialize', paymentInitRateLimit, optionalAuthenticate, async (req, res) => {
+  const secret = String(process.env.PAYSTACK_SECRET_KEY || '').trim();
+  if (!secret) return res.status(503).json({ success: false, error: 'Secure Paystack checkout is not configured on the server.' });
+  const currency = String(req.body.paymentCurrency || '').trim().toUpperCase();
+  const checkoutRequestId = String(req.body.checkoutRequestId || '').trim();
+  if (!PAYSTACK_CURRENCIES.has(currency)) return res.status(400).json({ success: false, error: 'Choose a Paystack-supported checkout currency.' });
+  if (!/^[a-zA-Z0-9_-]{20,80}$/.test(checkoutRequestId)) return res.status(400).json({ success: false, error: 'A valid checkout request ID is required.' });
+  try {
+    const email = String(req.body.email || '').trim().toLowerCase();
+    const existing = await findOrderByCheckoutRequestId(checkoutRequestId);
+    let unpricedOrder;
+    let amount;
+    if (existing) {
+      if (String(existing.email || '').toLowerCase() !== email) return res.status(409).json({ success: false, error: 'This checkout request is already in use.' });
+      if (existing.paymentAuthorizationUrl && existing.paymentStatus === 'pending_verification') {
+        return res.json({ success: true, data: checkoutOrderSummary(existing), authorizationUrl: existing.paymentAuthorizationUrl });
+      }
+      if (existing.paymentStatus !== 'pending_verification' || existing.paymentCurrency !== currency) {
+        return res.status(409).json({ success: false, error: 'This checkout request has already been used. Start checkout again.' });
+      }
+      amount = Number(existing.paymentAmount);
+      if (!Number.isSafeInteger(amount) || amount < 1) return res.status(409).json({ success: false, error: 'This checkout request cannot be resumed. Start checkout again.' });
+      unpricedOrder = existing;
+    } else {
+      const rate = await getPaystackRate(currency);
+      if (!rate) return res.status(422).json({ success: false, error: 'Could not determine the payment amount for this currency.' });
+      const reference = `BC-${crypto.randomBytes(24).toString('hex')}`;
+      unpricedOrder = await createOrderRecord(req.body, { reference, currency, checkoutRequestId }, req.user?._id || req.user?.id);
+      amount = Math.round(Number(unpricedOrder.total || 0) * rate * 100);
+      if (!Number.isSafeInteger(amount) || amount < 1) {
+        unpricedOrder.paymentStatus = 'cancelled';
+        unpricedOrder.status = 'Cancelled';
+        unpricedOrder.paymentVerification = 'invalid_amount';
+        await saveOrder(unpricedOrder);
+        return res.status(422).json({ success: false, error: 'This order total cannot be charged in the selected currency.' });
+      }
+      unpricedOrder.paymentAmount = amount;
+      await saveOrder(unpricedOrder);
+    }
+    const callbackUrl = new URL('/', storefrontOrigin(req));
+    callbackUrl.searchParams.set('checkout', 'paystack');
+    const response = await fetch('https://api.paystack.co/transaction/initialize', {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${secret}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        email: unpricedOrder.email,
+        amount,
+        currency,
+        reference: unpricedOrder.paymentReference,
+        callback_url: callbackUrl.toString(),
+        metadata: { order_id: unpricedOrder.id, checkout_request_id: checkoutRequestId },
+      }),
+      signal: AbortSignal.timeout(15000),
+    });
+    const payload = await response.json().catch(() => ({}));
+    const authorizationUrl = String(payload.data?.authorization_url || '');
+    let parsedAuthorizationUrl;
+    try { parsedAuthorizationUrl = new URL(authorizationUrl); } catch { parsedAuthorizationUrl = null; }
+    if (!response.ok || payload.status !== true || parsedAuthorizationUrl?.protocol !== 'https:' || parsedAuthorizationUrl?.hostname !== 'checkout.paystack.com') {
+      unpricedOrder.paymentStatus = 'cancelled';
+      unpricedOrder.status = 'Cancelled';
+      unpricedOrder.paymentVerification = 'initialization_failed';
+      await saveOrder(unpricedOrder);
+      return res.status(502).json({ success: false, error: 'Paystack could not initialize this payment. No charge was started.' });
+    }
+    unpricedOrder.paymentAuthorizationUrl = parsedAuthorizationUrl.toString();
+    unpricedOrder.paymentVerification = 'server_initialized';
+    await saveOrder(unpricedOrder);
+    void notifyOrderCreated(unpricedOrder).catch(error => console.error('Could not prepare order notification:', error.message));
+    res.json({ success: true, data: checkoutOrderSummary(unpricedOrder), authorizationUrl: unpricedOrder.paymentAuthorizationUrl });
+  } catch (error) {
+    if (error.status) return res.status(error.status).json({ success: false, error: error.message });
+    if (error.code === 11000) return res.status(409).json({ success: false, error: 'This checkout request or payment reference has already been used.' });
+    res.status(502).json({ success: false, error: 'Could not securely initialize payment with Paystack.' });
+  }
+});
+
+app.post('/api/payments/paystack/verify', paymentVerifyRateLimit, async (req, res) => {
+  const reference = String(req.body.reference || '').trim();
+  if (!reference || reference.length > 160) return res.status(400).json({ success: false, error: 'A valid payment reference is required.' });
+  try {
+    const order = await findOrderByPaymentReference(reference);
+    if (!order) return res.status(404).json({ success: false, error: 'No order was found for this payment reference.' });
+    if (order.paymentStatus !== 'paid' && !['cancelled', 'refunded', 'partially_refunded'].includes(String(order.paymentStatus || '').toLowerCase())) {
+      const verification = await checkPaystackPayment(order);
+      if (verification.verified) {
+        order.paymentAmount = Number(verification.amount);
+        await markOrderPaymentVerified(order, 'customer_callback');
+      }
+    }
+    return res.json({ success: true, data: checkoutOrderSummary(order), paymentStatus: order.paymentStatus });
+  } catch {
+    return res.status(502).json({ success: false, error: 'Could not check the payment with Paystack. Use your order reference to contact support.' });
+  }
+});
 app.get('/api/admin/orders', authenticate, adminRoles, async (_req, res) => {
   try { res.json({ success: true, data: await getAllOrders() }); }
   catch (error) { res.status(500).json({ success: false, error: error.message }); }
@@ -942,27 +1166,37 @@ app.get('/api/orders', authenticate, adminRoles, async (_req, res) => {
 });
 app.get('/api/account/orders', authenticate, async (req, res) => {
   try {
-    const orders = (await getAllOrders()).filter(order => String(order.email || '').toLowerCase() === String(req.user.email).toLowerCase());
+    const userId = String(req.user._id || req.user.id);
+    const orders = (await getAllOrders()).filter(order => String(order.customerUserId || '') === userId);
     res.json({ success: true, data: orders.map(order => ({ ...order, items: (order.items || []).map(item => ({ ...item, supplierCost: undefined, supplierName: undefined })) })) });
   } catch (error) { res.status(500).json({ success: false, error: error.message }); }
 });
 
 app.post('/api/payments/paystack/webhook', async (req, res) => {
-  const secret = String(process.env.PAYSTACK_SECRET_KEY || '').trim();
-  if (!secret) return res.status(503).send('Paystack verification is not configured.');
-  const signature = String(req.get('x-paystack-signature') || '');
-  if (!signature || !req.rawBody) return res.status(400).send('Missing Paystack signature.');
-  const expected = crypto.createHmac('sha512', secret).update(req.rawBody).digest('hex');
-  const suppliedBuffer = Buffer.from(signature, 'hex');
-  const expectedBuffer = Buffer.from(expected, 'hex');
-  if (suppliedBuffer.length !== expectedBuffer.length || !crypto.timingSafeEqual(suppliedBuffer, expectedBuffer)) {
-    return res.status(401).send('Invalid Paystack signature.');
-  }
-  if (req.body?.event !== 'charge.success') return res.sendStatus(200);
+  if (!isValidPaystackWebhook(req)) return res.status(401).send('Invalid Paystack signature.');
   try {
+    if (req.body?.event === 'refund.processed') {
+      const refund = req.body?.data || {};
+      const reference = String(refund.transaction_reference || refund.reference || refund.transaction?.reference || '').trim();
+      const order = await findOrderByPaymentReference(reference);
+      if (!order || order.paymentStatus === 'refunded') return res.sendStatus(200);
+      const refundedAmount = Number(refund.amount);
+      if (!Number.isSafeInteger(refundedAmount) || refundedAmount <= 0) return res.sendStatus(200);
+      const refundId = String(refund.id || refund.reference || '').trim().slice(0, 160);
+      if (refundId && (order.paymentRefundIds || []).includes(refundId)) return res.sendStatus(200);
+      const totalPaid = Number(order.paymentAmount);
+      order.paymentRefundedAmount = Math.min(Number.isSafeInteger(totalPaid) && totalPaid > 0 ? totalPaid : Number(order.paymentRefundedAmount || 0) + refundedAmount, Number(order.paymentRefundedAmount || 0) + refundedAmount);
+      if (refundId) order.paymentRefundIds = [...(order.paymentRefundIds || []), refundId].slice(-100);
+      order.paymentStatus = Number.isSafeInteger(totalPaid) && totalPaid > 0 && order.paymentRefundedAmount >= totalPaid ? 'refunded' : 'partially_refunded';
+      if (order.paymentStatus === 'refunded') order.status = 'Refunded';
+      const saved = await saveOrder(order);
+      void notifyOrderStatusChanged(saved).catch(error => console.error('Could not prepare refund status email:', error.message));
+      return res.sendStatus(200);
+    }
+    if (req.body?.event !== 'charge.success') return res.sendStatus(200);
     const reference = String(req.body?.data?.reference || '').trim();
     const order = await findOrderByPaymentReference(reference);
-    if (!order || order.paymentStatus === 'paid') return res.sendStatus(200);
+    if (!order || order.paymentStatus === 'paid' || ['refunded', 'partially_refunded'].includes(String(order.paymentStatus || '').toLowerCase())) return res.sendStatus(200);
     const verification = await checkPaystackPayment(order);
     if (!verification.verified) {
       console.warn(`Paystack webhook for order ${order.id} was not verified: ${verification.error}`);
@@ -983,6 +1217,7 @@ app.post('/api/admin/orders/:id/verify-paystack', authenticate, requireRoles('su
     if (!order) return res.status(404).json({ success: false, error: 'Order not found.' });
     if (!order.paymentReference) return res.status(400).json({ success: false, error: 'This order has no Paystack transaction reference.' });
     if (order.paymentStatus === 'paid') return res.json({ success: true, data: order, message: 'Payment is already verified.' });
+    if (['refunded', 'partially_refunded'].includes(String(order.paymentStatus || '').toLowerCase())) return res.status(409).json({ success: false, error: 'This transaction has a refund recorded and cannot be marked as paid again.' });
     const verification = await checkPaystackPayment(order);
     if (!verification.verified) return res.status(422).json({ success: false, error: verification.error || 'Paystack could not verify this payment.' });
     order.paymentAmount = Number(verification.amount);
@@ -1000,7 +1235,22 @@ app.patch('/api/admin/orders/:id', authenticate, adminRoles, async (req, res) =>
     const previousStatus = order.status;
     const previousTracking = order.tracking || '';
     const previousTrackingUrl = order.trackingUrl || '';
-    if (req.body.status && ['Pending', 'Processing', 'Shipped', 'Delivered', 'Cancelled', 'Canceled', 'Refunded'].includes(req.body.status)) order.status = req.body.status;
+    if (req.body.status && ['Pending', 'Processing', 'Shipped', 'Delivered', 'Cancelled', 'Canceled', 'Refunded'].includes(req.body.status)) {
+      if (['Processing', 'Shipped', 'Delivered'].includes(req.body.status)
+        && ['Cancelled', 'Canceled', 'Refunded'].includes(order.status)) {
+        return res.status(409).json({ success: false, error: 'A cancelled or refunded order cannot move into fulfillment.' });
+      }
+      if (['Processing', 'Shipped', 'Delivered'].includes(req.body.status)
+        && String(order.paymentMethod || '').toLowerCase().includes('paystack')
+        && order.paymentStatus !== 'paid') {
+        return res.status(409).json({ success: false, error: 'Verify the Paystack payment before moving this order into fulfillment.' });
+      }
+      if (['Processing', 'Shipped', 'Delivered'].includes(req.body.status)
+        && ['refunded', 'partially_refunded'].includes(String(order.paymentStatus || '').toLowerCase())) {
+        return res.status(409).json({ success: false, error: 'A refunded order cannot move into fulfillment.' });
+      }
+      order.status = req.body.status;
+    }
     if ('tracking' in req.body) {
       const tracking = String(req.body.tracking || '').trim();
       if (tracking.length > 150) return res.status(400).json({ success: false, error: 'Tracking numbers must be 150 characters or fewer.' });
@@ -1037,7 +1287,7 @@ app.post('/api/admin/users', authenticate, requireRoles('super_admin'), async (r
   const email = String(req.body.email || '').trim().toLowerCase();
   const password = String(req.body.password || '');
   const role = ['admin', 'moderator'].includes(req.body.role) ? req.body.role : 'moderator';
-  if (!name || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email) || password.length < 10) return res.status(400).json({ success: false, error: 'Name, valid email, and 10+ character password are required.' });
+  if (!name || name.length > 100 || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email) || email.length > 254 || password.length < 10 || password.length > 256) return res.status(400).json({ success: false, error: 'Name, valid email, and a 10–256 character password are required.' });
   if (await findUserByEmail(email)) return res.status(409).json({ success: false, error: 'An account with this email already exists.' });
   try {
     const userData = { name, email, passwordHash: await hashPassword(password), role, status: 'Active' };
@@ -1055,7 +1305,10 @@ app.patch('/api/admin/users/:id', authenticate, requireRoles('super_admin'), asy
     if (!user || user.role === 'super_admin') return res.status(404).json({ success: false, error: 'Managed team member not found.' });
     if (['Active', 'Disabled'].includes(req.body.status)) user.status = req.body.status;
     if (['admin', 'moderator'].includes(req.body.role)) user.role = req.body.role;
-    if (typeof req.body.password === 'string' && req.body.password.length >= 10) user.passwordHash = await hashPassword(req.body.password);
+    if (typeof req.body.password === 'string' && req.body.password.length > 0) {
+      if (req.body.password.length < 10 || req.body.password.length > 256) return res.status(400).json({ success: false, error: 'New passwords must be between 10 and 256 characters.' });
+      user.passwordHash = await hashPassword(req.body.password);
+    }
     if (mongoose.connection.readyState === 1) await user.save();
     else memoryUsers.set(String(user.email).toLowerCase(), user);
     res.json({ success: true, data: publicUser(user) });
@@ -1077,6 +1330,7 @@ app.use('/api/dropship', createDropshipRouter({
   authenticate,
   requireAdmin: adminRoles,
   requirePublisher: editorRoles,
+  rateLimit,
   getAllProducts,
   getAllOrders,
   saveProduct,
@@ -1085,7 +1339,21 @@ app.use('/api/dropship', createDropshipRouter({
   findOrder,
 }));
 
-app.listen(PORT, async () => {
-  console.log(`🚀 Shoppercart Backend API running on port ${PORT}`);
+app.use((error, _req, res, _next) => {
+  console.error('Unhandled API error:', error.message);
+  if (res.headersSent) return;
+  const status = Number(error.status) >= 400 && Number(error.status) < 500 ? Number(error.status) : 500;
+  res.status(status).json({ success: false, error: status < 500 ? error.message : 'An internal server error occurred.' });
+});
+
+async function startServer() {
+  if (isProduction && (!JWT_SECRET || JWT_SECRET.length < 32)) throw new Error('JWT_SECRET must be configured with at least 32 characters in production.');
   await connectDB();
+  if (isProduction && mongoose.connection.readyState !== 1) throw new Error('MongoDB is required for production startup.');
+  app.listen(PORT, () => console.log(`🚀 Shoppercart Backend API running on port ${PORT}`));
+}
+
+startServer().catch(error => {
+  console.error('Backend startup failed:', error.message);
+  process.exitCode = 1;
 });
