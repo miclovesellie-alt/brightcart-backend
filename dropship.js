@@ -707,7 +707,9 @@ export function createDropshipRouter({
       supplier: { connected: false, provider: null, automaticPurchasing: false, mode: 'Manual records only', setup: 'No official supplier API is configured. Add a provider adapter and server-side credentials before enabling stock sync or automatic ordering.' },
       ai: await aiStatus(),
       pricing: pricePolicy(),
-      payment: { mode: 'manual confirmation', serverVerification: false, setup: 'Checkout callbacks are recorded as pending verification. A super admin must verify the payment externally before any supplier purchase can be recorded.' },
+      payment: String(process.env.PAYSTACK_SECRET_KEY || '').trim()
+        ? { mode: 'automatic verification', serverVerification: true, setup: 'Successful Paystack payments are checked by the backend, and signed Paystack webhooks update order status. Add the webhook URL in Paystack: /api/payments/paystack/webhook.' }
+        : { mode: 'manual verification', serverVerification: false, setup: 'Checkout callbacks stay pending until a super admin verifies the transaction. Add PAYSTACK_SECRET_KEY to enable automatic server verification and webhooks.' },
     });
   });
 

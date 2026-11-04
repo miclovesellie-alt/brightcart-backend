@@ -32,7 +32,7 @@ const allowedOrigins = process.env.CORS_ORIGIN
   ? process.env.CORS_ORIGIN.split(',').map(origin => origin.trim()).filter(Boolean)
   : '*';
 app.use(cors({ origin: allowedOrigins }));
-app.use(express.json({ limit: '1mb' }));
+app.use(express.json({ limit: '1mb', verify: (req, _res, buffer) => { req.rawBody = buffer; } }));
 app.use(morgan('dev'));
 
 // MongoDB Schemas & Models
@@ -84,8 +84,11 @@ const orderSchema = new mongoose.Schema({
   status: { type: String, default: 'Pending' },
   supplier: String,
   tracking: String,
+  trackingUrl: String,
   paymentStatus: { type: String, enum: ['unpaid', 'pending_verification', 'paid', 'cancelled', 'refunded'], default: 'unpaid' },
   paymentReference: String,
+  paymentCurrency: String,
+  paymentAmount: Number,
   paymentVerification: String,
   paymentVerifiedBy: String,
   paymentVerifiedAt: Date,
@@ -351,6 +354,13 @@ async function findOrder(id) {
   return memoryOrders.find(order => String(order.id) === normalized) || null;
 }
 
+async function findOrderByPaymentReference(reference) {
+  const normalized = String(reference || '').trim();
+  if (!normalized) return null;
+  if (mongoose.connection.readyState === 1) return Order.findOne({ paymentReference: normalized });
+  return memoryOrders.find(order => String(order.paymentReference || '') === normalized) || null;
+}
+
 async function saveOrder(order) {
   if (mongoose.connection.readyState === 1) {
     const found = await Order.findOne({ id: String(order.id) });
@@ -474,6 +484,72 @@ async function sendTransactionalEmail({ to, subject, text, html }) {
   return true;
 }
 
+const PAYSTACK_CURRENCIES = new Set(['GHS', 'NGN', 'USD', 'ZAR', 'KES']);
+let paystackRatesCache = { fetchedAt: 0, rates: null };
+
+async function getPaystackRate(currency) {
+  if (currency === 'USD') return 1;
+  if (!PAYSTACK_CURRENCIES.has(currency)) return null;
+  if (!paystackRatesCache.rates || Date.now() - paystackRatesCache.fetchedAt > 60 * 60 * 1000) {
+    const response = await fetch('https://open.er-api.com/v6/latest/USD', { signal: AbortSignal.timeout(10000) });
+    if (!response.ok) throw new Error(`Exchange rate service returned ${response.status}.`);
+    const payload = await response.json();
+    if (payload.result !== 'success' || !payload.rates) throw new Error('Exchange rate service did not return current rates.');
+    paystackRatesCache = { fetchedAt: Date.now(), rates: payload.rates };
+  }
+  const rate = Number(paystackRatesCache.rates[currency]);
+  return Number.isFinite(rate) && rate > 0 ? rate : null;
+}
+
+async function checkPaystackPayment(order) {
+  const secret = String(process.env.PAYSTACK_SECRET_KEY || '').trim();
+  if (!secret) return { verified: false, error: 'Server-side Paystack verification is not configured.' };
+  if (!order?.paymentReference) return { verified: false, error: 'This order has no Paystack reference.' };
+  const response = await fetch(`https://api.paystack.co/transaction/verify/${encodeURIComponent(order.paymentReference)}`, {
+    headers: { Authorization: `Bearer ${secret}` },
+    signal: AbortSignal.timeout(12000),
+  });
+  const payload = await response.json().catch(() => ({}));
+  if (!response.ok || payload.status !== true || !payload.data) {
+    return { verified: false, error: payload.message || `Paystack verification returned ${response.status}.` };
+  }
+
+  const transaction = payload.data;
+  const expectedCurrency = String(order.paymentCurrency || '').toUpperCase();
+  const currency = expectedCurrency || String(transaction.currency || '').toUpperCase();
+  if (!PAYSTACK_CURRENCIES.has(currency)) return { verified: false, error: 'The payment currency is missing or unsupported.' };
+  if (String(transaction.reference || '') !== String(order.paymentReference)) return { verified: false, error: 'The Paystack reference does not match this order.' };
+  if (String(transaction.status || '').toLowerCase() !== 'success') return { verified: false, error: `Paystack reports this payment as ${transaction.status || 'unconfirmed'}.` };
+  if (String(transaction.currency || '').toUpperCase() !== currency) return { verified: false, error: 'The Paystack transaction currency does not match the order.' };
+  const transactionEmail = String(transaction.customer?.email || '').trim().toLowerCase();
+  if (transactionEmail && transactionEmail !== String(order.email || '').trim().toLowerCase()) return { verified: false, error: 'The Paystack payer email does not match the order.' };
+
+  let rate;
+  try { rate = await getPaystackRate(currency); }
+  catch (error) { return { verified: false, error: `Could not confirm the currency conversion: ${error.message}` }; }
+  if (!rate) return { verified: false, error: 'Could not determine the expected payment amount for this currency.' };
+  const expectedAmount = Math.round(Number(order.total || 0) * rate * 100);
+  if (!Number.isFinite(expectedAmount) || Number(transaction.amount) !== expectedAmount) {
+    return { verified: false, error: 'The amount paid does not match the current order total.' };
+  }
+  if (!order.paymentCurrency) order.paymentCurrency = currency;
+  return { verified: true, amount: transaction.amount, currency };
+}
+
+async function markOrderPaymentVerified(order, source, notifyStatusChange = true) {
+  if (order.paymentStatus === 'paid') return order;
+  const previousStatus = order.status;
+  order.paymentStatus = 'paid';
+  order.paymentVerification = `paystack_${source}`;
+  order.paymentVerifiedAt = new Date();
+  if (order.status === 'Pending payment verification') order.status = 'Pending';
+  const saved = await saveOrder(order);
+  if (notifyStatusChange && previousStatus !== saved.status) {
+    void notifyOrderStatusChanged(saved).catch(error => console.error('Could not prepare order status email:', error.message));
+  }
+  return saved;
+}
+
 async function notifyOrderCreated(order) {
   const settings = await getStoreSettings();
   const notifications = settings.notifications;
@@ -507,8 +583,8 @@ async function notifyOrderStatusChanged(order) {
     await sendTransactionalEmail({
       to: order.email,
       subject: `Shoppercart order ${order.id} update`,
-      text: `Hi ${order.customer},\n\nYour order ${order.id} is now ${order.status}.\n\nThank you for shopping with Shoppercart.`,
-      html: `<p>Hi ${escapeHtml(order.customer)},</p><p>Your order <strong>${escapeHtml(order.id)}</strong> is now <strong>${escapeHtml(order.status)}</strong>.</p><p>Thank you for shopping with Shoppercart.</p>`,
+      text: `Hi ${order.customer},\n\nYour order ${order.id} is now ${order.status}.${order.tracking ? `\nTracking number: ${order.tracking}` : ''}${order.trackingUrl ? `\nTrack your shipment: ${order.trackingUrl}` : ''}\n\nThank you for shopping with us.`,
+      html: `<p>Hi ${escapeHtml(order.customer)},</p><p>Your order <strong>${escapeHtml(order.id)}</strong> is now <strong>${escapeHtml(order.status)}</strong>.</p>${order.tracking ? `<p>Tracking number: <strong>${escapeHtml(order.tracking)}</strong></p>` : ''}${order.trackingUrl ? `<p><a href="${escapeHtml(order.trackingUrl)}">Track your shipment</a></p>` : ''}<p>Thank you for shopping with us.</p>`,
     });
   } catch (error) {
     console.error('Order status email failed:', error.message);
@@ -519,7 +595,7 @@ async function notifyOrderStatusChanged(order) {
 app.get('/api/health', (_req, res) => {
   res.json({
     status: 'ok',
-    name: 'Shoppercart API',
+    name: 'Store API',
     database: mongoose.connection.readyState === 1 ? 'connected' : 'memory-only',
     authenticationConfigured: Boolean(JWT_SECRET && JWT_SECRET.length >= 32),
     timestamp: new Date().toISOString(),
@@ -640,6 +716,24 @@ app.patch('/api/admin/store-settings', authenticate, storeSettingsAdmin, async (
   } catch (error) { res.status(400).json({ success: false, error: error.message }); }
 });
 
+app.post('/api/admin/store-settings/test-email', authenticate, storeSettingsAdmin, async (_req, res) => {
+  const emailStatus = emailProviderStatus();
+  if (!emailStatus.configured) return res.status(503).json({ success: false, error: 'Email is not configured. Add RESEND_API_KEY and EMAIL_FROM to the backend environment.' });
+  try {
+    const settings = await getStoreSettings();
+    if (!settings.notificationEmail) return res.status(400).json({ success: false, error: 'Save an admin notification inbox before sending a test email.' });
+    await sendTransactionalEmail({
+      to: settings.notificationEmail,
+      subject: 'Your store email setup is working',
+      text: 'This is a test email from your store admin settings. Your email provider and notification inbox are connected.',
+      html: '<p>This is a test email from your store admin settings.</p><p>Your email provider and notification inbox are connected.</p>',
+    });
+    res.json({ success: true, sentTo: settings.notificationEmail, message: `Test email sent to ${settings.notificationEmail}.` });
+  } catch (error) {
+    res.status(502).json({ success: false, error: `Could not send the test email: ${error.message}` });
+  }
+});
+
 app.get('/api/admin/products', authenticate, editorRoles, async (_req, res) => {
   try { res.json({ success: true, data: (await getAllProducts()).sort((a, b) => Number(b.id) - Number(a.id)) }); }
   catch (error) { res.status(500).json({ success: false, error: error.message }); }
@@ -705,6 +799,34 @@ async function createOrder(req, res) {
     if (!customer || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email) || incomingItems.length === 0) {
       return res.status(400).json({ success: false, error: 'Customer name, valid email, and at least one product are required.' });
     }
+    const paystack = String(req.body.paymentMethod || '').toLowerCase().includes('paystack');
+    const paymentReference = paystack ? String(req.body.paymentRef || '').trim() : '';
+    const paymentCurrency = paystack ? String(req.body.paymentCurrency || '').trim().toUpperCase() : '';
+    if (paystack && !paymentReference) return res.status(400).json({ success: false, error: 'The Paystack transaction reference is required.' });
+    if (paystack && !PAYSTACK_CURRENCIES.has(paymentCurrency)) return res.status(400).json({ success: false, error: 'This Paystack currency is not supported for server verification.' });
+    if (paystack) {
+      const existing = await findOrderByPaymentReference(paymentReference);
+      if (existing) {
+        if (String(existing.email || '').toLowerCase() !== email) {
+          return res.status(409).json({ success: false, error: 'This Paystack reference is already attached to another order.' });
+        }
+        if (existing.paymentStatus !== 'paid') {
+          try {
+            const verification = await checkPaystackPayment(existing);
+            if (verification.verified) {
+              existing.paymentAmount = Number(verification.amount);
+              await markOrderPaymentVerified(existing, 'server', false);
+            }
+          } catch (error) { console.error('Paystack verification could not be completed:', error.message); }
+        }
+        const saved = await findOrder(existing.id) || existing;
+        return res.json({
+          success: true,
+          data: { id: saved.id, status: saved.status, paymentStatus: saved.paymentStatus, paymentReference: saved.paymentReference, total: saved.total },
+          paymentStatus: saved.paymentStatus,
+        });
+      }
+    }
     const catalog = await getAllProducts();
     const items = [];
     for (const incoming of incomingItems) {
@@ -763,7 +885,6 @@ async function createOrder(req, res) {
     const subtotal = items.reduce((sum, item) => sum + Number(item.product.price) * item.qty, 0);
     const shipping = subtotal > 50 ? 0 : 4.99;
     const tax = subtotal * 0.08;
-    const paystack = String(req.body.paymentMethod || '').toLowerCase().includes('paystack');
     const order = {
       id: `ORD-${Date.now()}-${crypto.randomBytes(2).toString('hex')}`,
       customer,
@@ -781,12 +902,30 @@ async function createOrder(req, res) {
       total: subtotal + shipping + tax,
       status: paystack ? 'Pending payment verification' : 'Pending',
       paymentStatus: paystack ? 'pending_verification' : 'unpaid',
-      paymentReference: paystack ? String(req.body.paymentRef || '').trim() : undefined,
+      paymentReference: paystack ? paymentReference : undefined,
+      paymentCurrency: paystack ? paymentCurrency : undefined,
       paymentVerification: paystack ? 'client_callback_unverified' : undefined,
       paymentMethod: String(req.body.paymentMethod || ''),
       supplierPurchaseStatus: 'not_started',
     };
-    const created = await saveOrder(order);
+    let created = await saveOrder(order);
+    if (paystack && String(process.env.PAYSTACK_SECRET_KEY || '').trim()) {
+      try {
+        const verification = await checkPaystackPayment(created);
+        if (verification.verified) {
+          created.paymentAmount = Number(verification.amount);
+          created = await markOrderPaymentVerified(created, 'server', false);
+        } else {
+          created.paymentVerification = 'verification_pending';
+          created = await saveOrder(created);
+          console.info(`Payment for order ${created.id} needs review: ${verification.error}`);
+        }
+      } catch (error) {
+        created.paymentVerification = 'verification_unavailable';
+        created = await saveOrder(created);
+        console.error(`Could not verify payment for order ${created.id}:`, error.message);
+      }
+    }
     void notifyOrderCreated(created).catch(error => console.error('Could not prepare order notification:', error.message));
     res.status(201).json({ success: true, data: created, paymentStatus: created.paymentStatus });
   } catch (error) { res.status(500).json({ success: false, error: error.message }); }
@@ -808,14 +947,78 @@ app.get('/api/account/orders', authenticate, async (req, res) => {
   } catch (error) { res.status(500).json({ success: false, error: error.message }); }
 });
 
+app.post('/api/payments/paystack/webhook', async (req, res) => {
+  const secret = String(process.env.PAYSTACK_SECRET_KEY || '').trim();
+  if (!secret) return res.status(503).send('Paystack verification is not configured.');
+  const signature = String(req.get('x-paystack-signature') || '');
+  if (!signature || !req.rawBody) return res.status(400).send('Missing Paystack signature.');
+  const expected = crypto.createHmac('sha512', secret).update(req.rawBody).digest('hex');
+  const suppliedBuffer = Buffer.from(signature, 'hex');
+  const expectedBuffer = Buffer.from(expected, 'hex');
+  if (suppliedBuffer.length !== expectedBuffer.length || !crypto.timingSafeEqual(suppliedBuffer, expectedBuffer)) {
+    return res.status(401).send('Invalid Paystack signature.');
+  }
+  if (req.body?.event !== 'charge.success') return res.sendStatus(200);
+  try {
+    const reference = String(req.body?.data?.reference || '').trim();
+    const order = await findOrderByPaymentReference(reference);
+    if (!order || order.paymentStatus === 'paid') return res.sendStatus(200);
+    const verification = await checkPaystackPayment(order);
+    if (!verification.verified) {
+      console.warn(`Paystack webhook for order ${order.id} was not verified: ${verification.error}`);
+      return res.sendStatus(200);
+    }
+    order.paymentAmount = Number(verification.amount);
+    await markOrderPaymentVerified(order, 'webhook');
+    return res.sendStatus(200);
+  } catch (error) {
+    console.error('Paystack webhook processing failed:', error.message);
+    return res.sendStatus(500);
+  }
+});
+
+app.post('/api/admin/orders/:id/verify-paystack', authenticate, requireRoles('super_admin'), async (req, res) => {
+  try {
+    const order = await findOrder(req.params.id);
+    if (!order) return res.status(404).json({ success: false, error: 'Order not found.' });
+    if (!order.paymentReference) return res.status(400).json({ success: false, error: 'This order has no Paystack transaction reference.' });
+    if (order.paymentStatus === 'paid') return res.json({ success: true, data: order, message: 'Payment is already verified.' });
+    const verification = await checkPaystackPayment(order);
+    if (!verification.verified) return res.status(422).json({ success: false, error: verification.error || 'Paystack could not verify this payment.' });
+    order.paymentAmount = Number(verification.amount);
+    const saved = await markOrderPaymentVerified(order, 'admin_check');
+    res.json({ success: true, data: saved, message: 'Paystack payment verified.' });
+  } catch (error) {
+    res.status(502).json({ success: false, error: `Could not verify this payment with Paystack: ${error.message}` });
+  }
+});
+
 app.patch('/api/admin/orders/:id', authenticate, adminRoles, async (req, res) => {
   try {
     const order = await findOrder(req.params.id);
     if (!order) return res.status(404).json({ success: false, error: 'Order not found.' });
     const previousStatus = order.status;
+    const previousTracking = order.tracking || '';
+    const previousTrackingUrl = order.trackingUrl || '';
     if (req.body.status && ['Pending', 'Processing', 'Shipped', 'Delivered', 'Cancelled', 'Canceled', 'Refunded'].includes(req.body.status)) order.status = req.body.status;
+    if ('tracking' in req.body) {
+      const tracking = String(req.body.tracking || '').trim();
+      if (tracking.length > 150) return res.status(400).json({ success: false, error: 'Tracking numbers must be 150 characters or fewer.' });
+      order.tracking = tracking;
+    }
+    if ('trackingUrl' in req.body) {
+      const trackingUrl = String(req.body.trackingUrl || '').trim();
+      if (trackingUrl) {
+        let parsedUrl;
+        try { parsedUrl = new URL(trackingUrl); } catch { return res.status(400).json({ success: false, error: 'Enter a valid tracking URL.' }); }
+        if (!['http:', 'https:'].includes(parsedUrl.protocol)) return res.status(400).json({ success: false, error: 'Tracking links must use HTTP or HTTPS.' });
+      }
+      order.trackingUrl = trackingUrl;
+    }
     await saveOrder(order);
-    if (previousStatus !== order.status) void notifyOrderStatusChanged(order).catch(error => console.error('Could not prepare order status email:', error.message));
+    if (previousStatus !== order.status || previousTracking !== (order.tracking || '') || previousTrackingUrl !== (order.trackingUrl || '')) {
+      void notifyOrderStatusChanged(order).catch(error => console.error('Could not prepare order status email:', error.message));
+    }
     res.json({ success: true, data: order });
   } catch (error) { res.status(500).json({ success: false, error: error.message }); }
 });
