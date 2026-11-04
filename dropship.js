@@ -488,7 +488,7 @@ function pricePolicy() {
   const platformFeePercent = Number(process.env.DROPSHIP_PLATFORM_FEE_PERCENT ?? 0);
   const roundingIncrement = Number(process.env.DROPSHIP_PRICE_ROUNDING_INCREMENT ?? 1);
   return {
-    targetMarginPercent: 20,
+    targetMarginPercent: 35,
     paymentFeePercent: Number.isFinite(paymentFeePercent) && paymentFeePercent >= 0 ? paymentFeePercent : 0,
     platformFeePercent: Number.isFinite(platformFeePercent) && platformFeePercent >= 0 ? platformFeePercent : 0,
     roundingIncrement: Number.isFinite(roundingIncrement) && roundingIncrement > 0 ? roundingIncrement : 1,
