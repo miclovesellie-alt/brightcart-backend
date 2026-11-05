@@ -126,9 +126,15 @@ async function writeActivity(action, summary, actor, subjectId, details = {}) {
   return entry;
 }
 
-async function getResearch() {
-  if (dbReady()) return Research.find().sort({ createdAt: -1 }).limit(100).lean();
-  return memory.research;
+async function getResearch(loadProducts) {
+  const [candidates, products] = await Promise.all([
+    dbReady() ? Research.find().sort({ createdAt: -1 }).limit(100).lean() : Promise.resolve(memory.research),
+    loadProducts(),
+  ]);
+  const publishedResearchIds = new Set(products
+    .filter(product => product.researchId && (product.publishedAt || String(product.status || '').toLowerCase() === 'active'))
+    .map(product => String(product.researchId)));
+  return candidates.filter(candidate => candidate.state !== 'published' && !publishedResearchIds.has(String(candidate._id)));
 }
 
 async function getPurchases() {
@@ -1188,7 +1194,7 @@ export function createDropshipRouter({
       const cutoff = Date.now() - days * 24 * 60 * 60 * 1000;
       const previousCutoff = cutoff - days * 24 * 60 * 60 * 1000;
       const [products, orders, purchases, research, activity] = await Promise.all([
-        getAllProducts(), getAllOrders(), getPurchases(), getResearch(), getActivity(),
+        getAllProducts(), getAllOrders(), getPurchases(), getResearch(getAllProducts), getActivity(),
       ]);
       const periodOrders = orders.filter(order => new Date(order.createdAt || order.date || 0).getTime() >= cutoff);
       const previousPeriodOrders = orders.filter(order => {
@@ -1253,7 +1259,7 @@ export function createDropshipRouter({
   });
 
   router.get('/research', async (_req, res) => {
-    try { res.json({ success: true, data: await getResearch() }); }
+    try { res.json({ success: true, data: await getResearch(getAllProducts) }); }
     catch (error) { res.status(500).json({ success: false, error: error.message }); }
   });
 
@@ -1462,6 +1468,17 @@ export function createDropshipRouter({
       if (req.body.contentReviewed !== true) missing.push('final content review');
       if (missing.length) return res.status(422).json({ success: false, error: `Cannot publish yet. Complete: ${missing.join(', ')}.` });
       const saved = await saveProduct({ ...product, status: 'Active', policyReviewed: true, inventoryVerified: true, publishedAt: new Date() }, Number(req.params.id));
+      if (saved.researchId) {
+        try {
+          if (dbReady()) await Research.updateOne({ _id: saved.researchId }, { $set: { state: 'published' } });
+          else {
+            const candidate = memory.research.find(item => String(item._id) === String(saved.researchId));
+            if (candidate) candidate.state = 'published';
+          }
+        } catch (error) {
+          console.error('Could not mark published product research as complete:', error.message);
+        }
+      }
       await writeActivity('product_published', `Published ${saved.name} to the storefront`, safeUser(req), saved.id);
       await notifyAdmins({
         type: 'product_published',
