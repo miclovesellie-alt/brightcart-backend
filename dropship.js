@@ -13,6 +13,15 @@ const researchSchema = new mongoose.Schema({
   supplierUrl: String,
   imageUrl: String,
   images: { type: [String], default: [] },
+  brand: String,
+  supplierSku: String,
+  barcode: String,
+  mpn: String,
+  availability: String,
+  supplierRating: Number,
+  supplierReviewCount: Number,
+  priceRange: mongoose.Schema.Types.Mixed,
+  specifications: { type: [mongoose.Schema.Types.Mixed], default: [] },
   verifiedFacts: [String],
   variants: [mongoose.Schema.Types.Mixed],
   unitCost: { type: Number, default: null },
@@ -209,12 +218,23 @@ function toProduct(candidate) {
   ].filter(value => typeof value === 'string' && value.trim()).map(value => value.trim()))];
   const variants = Array.isArray(candidate.variants) ? candidate.variants.map(variant => ({
     id: clean(variant?.id || variant?.color || variant?.name),
-    name: clean(variant?.name || variant?.color),
-    color: clean(variant?.color || variant?.name),
+    name: clean(variant?.name || variant?.color || variant?.size),
+    color: clean(variant?.color),
+    size: clean(variant?.size),
+    attributes: variant?.attributes && typeof variant.attributes === 'object' ? variant.attributes : {},
     image: clean(variant?.image || variant?.imageUrl),
     images: Array.isArray(variant?.images) ? variant.images.filter(value => typeof value === 'string').slice(0, 20) : [],
     sku: clean(variant?.sku),
-  })).filter(variant => variant.color) : [];
+    barcode: clean(variant?.barcode || variant?.gtin),
+    supplierPrice: variant?.supplierPrice !== null && variant?.supplierPrice !== undefined && Number.isFinite(Number(variant.supplierPrice)) ? Number(variant.supplierPrice) : null,
+    supplierCurrency: clean(variant?.supplierCurrency || variant?.currency),
+    unitCost: variant?.unitCost !== null && variant?.unitCost !== undefined && Number.isFinite(Number(variant.unitCost)) ? Number(variant.unitCost) : null,
+    price: variant?.retailPrice !== null && variant?.retailPrice !== undefined && Number.isFinite(Number(variant.retailPrice)) ? Number(variant.retailPrice) : null,
+    stock: variant?.stock !== null && variant?.stock !== undefined && variant?.stock !== '' && Number.isInteger(Number(variant.stock)) ? Number(variant.stock) : null,
+  })).filter(variant => variant.color || variant.name || variant.size) : [];
+  const suppliedStock = candidate.availableStock !== null && candidate.availableStock !== undefined && candidate.availableStock !== '' && Number.isInteger(Number(candidate.availableStock))
+    ? Number(candidate.availableStock)
+    : variants.length && variants.every(variant => variant.stock !== null) ? variants.reduce((total, variant) => total + Number(variant.stock), 0) : 0;
   return {
     id: Date.now(),
     name: clean(content.title) || candidate.productName,
@@ -222,15 +242,20 @@ function toProduct(candidate) {
     price: Number.isFinite(Number(candidate.retailPrice)) ? Number(candidate.retailPrice) : 0,
     originalPrice: Number.isFinite(Number(candidate.retailPrice)) ? Number(candidate.retailPrice) : 0,
     cost: candidate.unitCost !== null && candidate.unitCost !== undefined && candidate.unitCost !== '' && Number.isFinite(Number(candidate.unitCost)) ? Number(candidate.unitCost) + (candidate.shippingStatus === 'free' ? 0 : Number(candidate.shippingCost || 0)) : undefined,
-    stock: Number.isInteger(Number(candidate.availableStock)) ? Number(candidate.availableStock) : 0,
+    stock: suppliedStock,
     image: images[0] || '',
     images,
     description: clean(content.description) || facts.join('\n'),
     featured: false,
     tag: 'Research draft',
-    sku: '',
     status: 'Draft',
     supplier: candidate.supplierName,
+    brand: clean(candidate.brand),
+    sku: clean(candidate.supplierSku),
+    barcode: clean(candidate.barcode),
+    mpn: clean(candidate.mpn),
+    availability: clean(candidate.availability),
+    specifications: Array.isArray(candidate.specifications) ? candidate.specifications : [],
     supplierDetails: {
       sourceUrl: candidate.sourceUrl,
       productUrl: candidate.supplierUrl || candidate.sourceUrl,
@@ -240,9 +265,18 @@ function toProduct(candidate) {
       shippingDestination: candidate.shippingDestination || '',
       shippingCurrency: candidate.shippingCurrency || candidate.supplierCurrency || '',
       shippingDays: candidate.shippingDays ?? null,
-      availableStock: Number.isFinite(Number(candidate.availableStock)) ? Number(candidate.availableStock) : null,
+      availableStock: candidate.availableStock !== null && candidate.availableStock !== undefined && candidate.availableStock !== '' && Number.isFinite(Number(candidate.availableStock)) ? Number(candidate.availableStock) : null,
       currency: candidate.currency || 'USD',
       supplierCurrency: candidate.supplierCurrency || candidate.currency || 'USD',
+      vendorSku: clean(candidate.supplierSku),
+      barcode: clean(candidate.barcode),
+      mpn: clean(candidate.mpn),
+      brand: clean(candidate.brand),
+      sourceAvailability: clean(candidate.availability),
+      sourceSpecifications: Array.isArray(candidate.specifications) ? candidate.specifications : [],
+      sourceRating: candidate.supplierRating ?? null,
+      sourceReviewCount: candidate.supplierReviewCount ?? null,
+      sourcePriceRange: candidate.priceRange || null,
       lastSyncAt: null,
       variants,
     },
@@ -505,7 +539,15 @@ function productOffer(product) {
   const offer = offers.find(item => item && (item.price != null || item.lowPrice != null)) || offers[0] || {};
   const priceValue = offer.price ?? offer.lowPrice ?? offer.priceSpecification?.price;
   const price = typeof priceValue === 'string' ? Number(priceValue.replace(/,/g, '').match(/[+-]?(?:\d+\.?\d*|\.\d+)/)?.[0]) : Number(priceValue);
-  return { price: Number.isFinite(price) && price > 0 ? price : null, currency: clean(offer.priceCurrency || offer.priceSpecification?.priceCurrency).toUpperCase() || null, offer };
+  const lowPrice = Number(offer.lowPrice ?? priceValue);
+  const highPrice = Number(offer.highPrice ?? priceValue);
+  return {
+    price: Number.isFinite(price) && price > 0 ? price : null,
+    lowPrice: Number.isFinite(lowPrice) && lowPrice > 0 ? lowPrice : null,
+    highPrice: Number.isFinite(highPrice) && highPrice > 0 ? highPrice : null,
+    currency: clean(offer.priceCurrency || offer.priceSpecification?.priceCurrency).toUpperCase() || null,
+    offer,
+  };
 }
 
 function productImages(product, html, baseUrl) {
@@ -530,22 +572,87 @@ function productVariantList(product, baseUrl) {
   const variants = [];
   for (const item of values) {
     if (!item || typeof item !== 'object') continue;
-    const color = clean(item.color || item.colorName);
-    if (!color) continue;
+    const attributes = {};
+    for (const key of ['color', 'size', 'material', 'pattern', 'style', 'model']) {
+      const value = item[key]?.name || item[key]?.value || item[key];
+      if (typeof value === 'string' || typeof value === 'number') {
+        const text = clean(value);
+        if (text) attributes[key] = text;
+      }
+    }
+    const color = clean(attributes.color || item.colorName);
+    const size = clean(attributes.size);
+    const name = [color, size].filter(Boolean).join(' / ') || clean(item.name || item.sku || item.productID);
+    if (!name) continue;
     const images = productImages(item, '', baseUrl);
     const offer = productOffer(item);
+    const stockValue = Number(item.inventoryLevel?.value ?? item.inventoryLevel ?? item.availableStock ?? item.stock ?? item.quantity);
     variants.push({
-      id: clean(item.sku || item.productID) || color.toLowerCase().replace(/[^a-z0-9]+/g, '-'),
-      name: color,
+      id: clean(item.sku || item.productID) || name.toLowerCase().replace(/[^a-z0-9]+/g, '-'),
+      name,
       color,
+      size,
+      attributes,
       image: images[0] || '',
       images,
       sku: clean(item.sku) || '',
+      barcode: clean(item.gtin || item.gtin13 || item.gtin14 || item.gtin12 || item.gtin8),
       price: offer.price,
       currency: offer.currency,
+      stock: Number.isInteger(stockValue) && stockValue >= 0 ? stockValue : null,
     });
   }
   return variants.slice(0, 30);
+}
+
+function schemaText(value) {
+  if (value == null) return '';
+  if (typeof value === 'string' || typeof value === 'number') return clean(value);
+  if (typeof value === 'object') {
+    const amount = value.value ?? value.name ?? value.identifier;
+    const unit = value.unitText ?? value.unitCode ?? value.unitName ?? '';
+    return [clean(amount), clean(unit)].filter(Boolean).join(' ');
+  }
+  return '';
+}
+
+function productSpecifications(product, html) {
+  const specs = [];
+  const add = (label, rawValue) => {
+    const value = schemaText(rawValue);
+    const normalizedLabel = clean(label).replace(/([a-z])([A-Z])/g, '$1 $2').replace(/[_-]+/g, ' ');
+    if (!normalizedLabel || !value || value.length > 500) return;
+    const key = normalizedLabel.toLowerCase();
+    if (!specs.some(spec => spec.label.toLowerCase() === key && spec.value === value)) {
+      specs.push({ label: normalizedLabel.replace(/\b\w/g, letter => letter.toUpperCase()), value, source: 'supplier listing' });
+    }
+  };
+  for (const property of Array.isArray(product.additionalProperty) ? product.additionalProperty : []) {
+    if (property?.name) add(property.name, property.value ?? property.valueReference);
+  }
+  for (const key of [
+    'brand', 'manufacturer', 'model', 'modelNumber', 'sku', 'mpn', 'gtin', 'gtin8', 'gtin12', 'gtin13', 'gtin14',
+    'material', 'pattern', 'size', 'color', 'countryOfOrigin', 'itemCondition', 'width', 'height', 'depth', 'weight',
+  ]) {
+    let value = product[key];
+    if (key === 'manufacturer' && value && typeof value === 'object') value = value.name;
+    if (key === 'brand' && value && typeof value === 'object') value = value.name;
+    add(key, value);
+  }
+  const labels = ['material', 'model', 'mpn', 'gtin', 'gtin8', 'gtin12', 'gtin13', 'gtin14', 'size', 'color', 'country_of_origin'];
+  for (const label of labels) add(label, pageMeta(html, `product:${label}`) || pageMeta(html, label));
+  for (const [label, key] of [['Width', 'width'], ['Height', 'height'], ['Depth', 'depth'], ['Weight', 'weight']]) {
+    const value = pageMeta(html, `product:${key}`) || pageMeta(html, key);
+    if (value) add(label, value);
+  }
+  return specs.slice(0, 60);
+}
+
+function exactStockFromSchema(product, offer) {
+  const raw = offer?.inventoryLevel?.value ?? offer?.inventoryLevel ?? product?.inventoryLevel?.value
+    ?? product?.inventoryLevel ?? product?.availableStock ?? product?.stock ?? product?.quantity;
+  const value = Number(raw);
+  return Number.isInteger(value) && value >= 0 ? value : null;
 }
 
 function normalizeCategory(value) {
@@ -644,6 +751,7 @@ function parseProductHtml(html, finalUrl, destination) {
   }
   const variants = productVariantList(product, finalUrl);
   const images = productImages(product, html, finalUrl);
+  const specifications = productSpecifications(product, html);
   const destinationShipping = shippingFromSchema(product, destination);
   const facts = [];
   if (description) facts.push(description);
@@ -651,22 +759,37 @@ function parseProductHtml(html, finalUrl, destination) {
   if (categoryRaw) facts.push(`Supplier category: ${categoryRaw}`);
   const sku = clean(product.sku || pageMeta(html, 'sku'));
   if (sku) facts.push(`Supplier SKU: ${sku}`);
+  const mpn = clean(product.mpn || pageMeta(html, 'product:mpn') || pageMeta(html, 'mpn'));
+  if (mpn) facts.push(`Manufacturer part number: ${mpn}`);
+  const barcode = clean(product.gtin14 || product.gtin13 || product.gtin12 || product.gtin8 || product.gtin || pageMeta(html, 'product:gtin') || pageMeta(html, 'gtin'));
+  if (barcode) facts.push(`Barcode / GTIN: ${barcode}`);
   const color = clean(product.color || pageMeta(html, 'color'));
   if (color) facts.push(`Listed color: ${color}`);
   const availability = clean(offer.offer?.availability || pageMeta(html, 'availability'));
   if (availability) facts.push(`Supplier listing availability: ${availability.split('/').pop().replace(/([A-Z])/g, ' $1').trim()}.`);
-  for (const prop of Array.isArray(product.additionalProperty) ? product.additionalProperty : []) {
-    const name = clean(prop.name);
-    const value = clean(prop.value);
-    if (name && value) facts.push(`${name}: ${value}`);
-  }
+  for (const spec of specifications) facts.push(`${spec.label}: ${spec.value}`);
   const variantsFromGroup = products.filter(item => clean(item.color) && item !== product).map(item => {
     const variantImages = productImages(item, '', finalUrl);
     const variantOffer = productOffer(item);
     const color = clean(item.color);
-    return { id: clean(item.sku || item.productID) || color.toLowerCase().replace(/[^a-z0-9]+/g, '-'), name: color, color, image: variantImages[0] || '', images: variantImages, sku: clean(item.sku) || '', price: variantOffer.price, currency: variantOffer.currency };
+    const size = schemaText(item.size);
+    const name = [color, size].filter(Boolean).join(' / ') || color;
+    return {
+      id: clean(item.sku || item.productID) || name.toLowerCase().replace(/[^a-z0-9]+/g, '-'),
+      name,
+      color,
+      size,
+      attributes: { ...(color ? { color } : {}), ...(size ? { size } : {}) },
+      image: variantImages[0] || '',
+      images: variantImages,
+      sku: clean(item.sku) || '',
+      barcode: clean(item.gtin || item.gtin13 || item.gtin14 || item.gtin12 || item.gtin8),
+      price: variantOffer.price,
+      currency: variantOffer.currency,
+      stock: exactStockFromSchema(item, variantOffer.offer),
+    };
   });
-  const allVariants = [...new Map([...variants, ...variantsFromGroup].map(item => [item.color.toLowerCase(), item])).values()].slice(0, 30);
+  const allVariants = [...new Map([...variants, ...variantsFromGroup].map(item => [String(item.id || item.name).toLowerCase(), item])).values()].slice(0, 30);
   const sourceCurrency = offer.currency;
   const sameCurrencyShipping = destinationShipping.status === 'free'
     || (destinationShipping.status === 'paid' && sourceCurrency && destinationShipping.currency === sourceCurrency);
@@ -675,7 +798,14 @@ function parseProductHtml(html, finalUrl, destination) {
     : null;
   const missingSignals = [];
   if (!offer.price) missingSignals.push('Supplier unit price');
+  if (offer.lowPrice != null && offer.highPrice != null && offer.highPrice > offer.lowPrice) missingSignals.push('Confirm vendor price for the selected variant');
+  if (!description) missingSignals.push('Product description');
   if (!images.length) missingSignals.push('Product images');
+  if (!brand) missingSignals.push('Brand');
+  if (!sku && !barcode && !mpn) missingSignals.push('Supplier SKU, barcode, or manufacturer part number');
+  if (!specifications.length) missingSignals.push('Technical specifications');
+  if (!availability) missingSignals.push('Supplier listing availability');
+  if (exactStockFromSchema(product, offer.offer) == null) missingSignals.push('Exact supplier inventory quantity');
   if (!destination) missingSignals.push('Shipping destination country');
   if (destinationShipping.status === 'unknown') missingSignals.push('Shipping cost to the selected destination');
   if (!suggestedRetailPrice) missingSignals.push('Retail price recommendation');
@@ -687,6 +817,14 @@ function parseProductHtml(html, finalUrl, destination) {
     supplierUrl: finalUrl,
     sourceUrl: finalUrl,
     description,
+    brand,
+    supplierSku: sku,
+    barcode,
+    mpn,
+    availability: clean(offer.offer?.availability || pageMeta(html, 'availability')),
+    supplierRating: Number(product.aggregateRating?.ratingValue) || null,
+    supplierReviewCount: Number(product.aggregateRating?.reviewCount ?? product.aggregateRating?.ratingCount) || null,
+    priceRange: { low: offer.lowPrice, high: offer.highPrice, currency: offer.currency },
     imageUrl: images[0] || '',
     images,
     unitCost: offer.price,
@@ -697,8 +835,9 @@ function parseProductHtml(html, finalUrl, destination) {
     shippingDestination: clean(destination).toUpperCase(),
     shippingDays: destinationShipping.days,
     suggestedRetailPrice,
-    availableStock: null,
+    availableStock: exactStockFromSchema(product, offer.offer),
     variants: allVariants,
+    specifications,
     verifiedFacts: [...new Set(facts)].slice(0, 30),
     missingSignals,
     pricingPolicy: pricePolicy(),
@@ -734,21 +873,31 @@ function parseCJProductDetails(data, finalUrl, destination) {
   const variants = rawVariants.map((item, index) => {
     const key = clean(item.variantkey || item.variantKey || item.variantStandard || item.variantNameEn || '');
     const values = key.split(/[-,|/]+/).map(value => value.trim()).filter(Boolean);
-    const color = clean(item.color || item.colour || (colorIndex >= 0 ? values[colorIndex] : ''));
-    if (!color) return null;
+    const labels = dimensionLabels;
+    const attributes = Object.fromEntries(labels.map((label, valueIndex) => [label, values[valueIndex]]).filter(([label, value]) => label && value));
+    const color = clean(item.color || item.colour || attributes.color || attributes.colour || (colorIndex >= 0 ? values[colorIndex] : ''));
+    const size = clean(item.size || attributes.size);
+    const name = [color, size].filter(Boolean).join(' / ') || key || clean(item.variantNameEn || item.nameEn);
+    if (!name) return null;
     const image = absolutePublicWebUrl(item.variantImage || item.img || item.image, finalUrl);
     const price = parseCJPrice(item.variantSellPrice ?? item.sellprice ?? item.sellPrice ?? item.price);
+    const rawStock = item.variantInventory ?? item.inventory ?? item.stock ?? item.availableStock;
+    const stockValue = rawStock == null || rawStock === '' ? Number.NaN : Number(rawStock);
     return {
-      id: clean(item.vid || item.id || item.variantSku || item.sku) || `${color}-${index + 1}`,
-      name: color,
+      id: clean(item.vid || item.id || item.variantSku || item.sku) || `${name}-${index + 1}`,
+      name,
       color,
+      size,
+      attributes,
       image,
       images: image ? [image] : [],
       sku: clean(item.variantSku || item.sku),
+      barcode: clean(item.gtin || item.barcode),
       price,
       currency: 'USD',
+      stock: Number.isInteger(stockValue) && stockValue >= 0 ? stockValue : null,
     };
-  }).filter(Boolean).slice(0, 30);
+  }).filter(item => item && (item.color || item.size || item.name)).slice(0, 30);
 
   let imageValues = data.productImageSet || data.productImages || data.images || [];
   if (typeof imageValues === 'string') {
@@ -770,7 +919,14 @@ function parseCJProductDetails(data, finalUrl, destination) {
   const facts = [];
   if (description) facts.push(description);
   if (categoryRaw) facts.push(`Supplier category: ${categoryRaw}`);
-  if (clean(data.sku || data.productSku)) facts.push(`Supplier SKU: ${clean(data.sku || data.productSku)}`);
+  const supplierSku = clean(data.sku || data.productSku || data.productCode);
+  const brand = clean(data.brandName || data.brand || data.productBrand);
+  const barcode = clean(data.gtin || data.barcode || data.ean || data.upc);
+  const mpn = clean(data.mpn || data.modelNumber || data.productModel);
+  if (supplierSku) facts.push(`Supplier SKU: ${supplierSku}`);
+  if (brand) facts.push(`Brand: ${brand}`);
+  if (barcode) facts.push(`Barcode / GTIN: ${barcode}`);
+  if (mpn) facts.push(`Manufacturer part number: ${mpn}`);
   if (unitCost != null && (/\d\s*[-–]\s*\d/.test(String(rawVendorPrice || '')) || variantPrices.length > 1)) {
     facts.push('Vendor price is a range; the lowest listed amount is used as the draft cost. Confirm the selected variant price before approval.');
   }
@@ -779,6 +935,25 @@ function parseCJProductDetails(data, finalUrl, destination) {
   const rawStock = data.availableStock ?? data.totalInventory;
   const availableStockValue = rawStock == null || rawStock === '' ? Number.NaN : Number(rawStock);
   const availableStock = Number.isInteger(availableStockValue) && availableStockValue >= 0 ? availableStockValue : null;
+  const specifications = [];
+  const addSpec = (label, value) => {
+    const normalizedLabel = clean(label);
+    const normalizedValue = schemaText(value);
+    if (normalizedLabel && normalizedValue && !specifications.some(item => item.label.toLowerCase() === normalizedLabel.toLowerCase())) {
+      specifications.push({ label: normalizedLabel, value: normalizedValue, source: 'CJ product API' });
+    }
+  };
+  for (const [label, value] of Object.entries({
+    Brand: brand, SKU: supplierSku, Barcode: barcode, Model: mpn,
+    Material: data.productMaterial || data.material,
+    Weight: data.productWeight || data.weight,
+    Dimensions: data.productSize || data.dimensions,
+    Origin: data.countryOfOrigin,
+  })) addSpec(label, value);
+  const rawAttributes = data.productProperties || data.productAttributes || data.attributes || data.productAttributeList || [];
+  const attributeList = Array.isArray(rawAttributes) ? rawAttributes : Object.entries(rawAttributes || {}).map(([name, value]) => ({ name, value }));
+  for (const attribute of attributeList) addSpec(attribute.name || attribute.attributeName || attribute.key, attribute.value || attribute.attributeValue || attribute.valueName);
+  for (const spec of specifications) facts.push(`${spec.label}: ${spec.value}`);
   const missingSignals = [];
   if (!unitCost) missingSignals.push('Supplier unit price');
   if (!images.length) missingSignals.push('Product images');
@@ -794,6 +969,14 @@ function parseCJProductDetails(data, finalUrl, destination) {
     supplierUrl: finalUrl,
     sourceUrl: finalUrl,
     description,
+    brand,
+    supplierSku,
+    barcode,
+    mpn,
+    availability: availableStock == null ? '' : 'Exact quantity returned by CJ product API',
+    supplierRating: null,
+    supplierReviewCount: null,
+    priceRange: variantPrices.length ? { low: variantPrices[0], high: variantPrices[variantPrices.length - 1], currency: 'USD' } : null,
     imageUrl: images[0] || '',
     images,
     unitCost,
@@ -806,6 +989,7 @@ function parseCJProductDetails(data, finalUrl, destination) {
     suggestedRetailPrice,
     availableStock,
     variants,
+    specifications,
     verifiedFacts: facts,
     missingSignals,
     pricingPolicy: pricePolicy(),
@@ -973,6 +1157,17 @@ export function createDropshipRouter({
           ? 'CJ product URLs use the official product API. Shipping quotes, live stock checks, and supplier orders still require review or separate adapters.'
           : 'Add CJ_API_KEY on the backend for reliable CJ product imports. Public HTML extraction remains available for other suppliers; pages with bot protection may need manual entry.',
       },
+      supplierSources: [
+        { name: 'CJdropshipping', mode: cjConfigured ? 'Official product API + public-page fallback' : 'Public-page fallback', status: cjConfigured ? 'Configured' : 'Needs CJ_API_KEY', connected: cjConfigured, note: 'Product lookup is automated when configured; destination shipping and order placement still need confirmation.' },
+        { name: 'AliExpress', mode: 'Public product-page import', status: 'Page access varies', connected: false, note: 'Public metadata can be imported when available. Bot-protected or incomplete pages require manual verification; product variants and destination shipping must be checked.' },
+        { name: 'Alibaba.com', mode: 'Supplier quote workflow', status: 'Manual quote review', connected: false, note: 'Keep supplier product links and enter the supplier’s confirmed quote, MOQ, shipping, lead time, and destination terms before drafting.' },
+        { name: 'Banggood', mode: 'Public product-page import', status: 'Page access varies', connected: false, note: 'Public-page extraction is available. Official API sync requires an approved dropship account and API credentials.' },
+        { name: 'BigBuy', mode: 'Public product-page import', status: 'API credentials required for sync', connected: false, note: 'Public-page extraction can be tried. Catalog, carrier, stock, and order synchronization needs a BigBuy API account and adapter configuration.' },
+      ],
+      salesChannels: [
+        { name: 'TikTok Shop', status: 'Seller app setup required', note: 'Requires your seller shop, a registered app, market-specific product/order scopes, app review as applicable, server credentials, and seller authorization.' },
+        { name: 'Jumia', status: 'Vendor API setup required', note: 'Requires a Jumia vendor account, application credentials, and authorization for the shop’s catalog and order scopes.' },
+      ],
       ai: await aiStatus(),
       pricing: pricePolicy(),
       payment: String(process.env.PAYSTACK_SECRET_KEY || '').trim()
@@ -1102,8 +1297,34 @@ export function createDropshipRouter({
       supplierUrl: clean(req.body.supplierUrl),
       imageUrl: clean(req.body.imageUrl),
       images: Array.isArray(req.body.images) ? [...new Set(req.body.images.map(clean).filter(Boolean))].slice(0, 20) : [],
+      brand: clean(req.body.brand).slice(0, 160),
+      supplierSku: clean(req.body.supplierSku).slice(0, 160),
+      barcode: clean(req.body.barcode).slice(0, 80),
+      mpn: clean(req.body.mpn).slice(0, 160),
+      availability: clean(req.body.availability).slice(0, 160),
+      supplierRating: req.body.supplierRating === '' || req.body.supplierRating == null ? null : Number(req.body.supplierRating),
+      supplierReviewCount: req.body.supplierReviewCount === '' || req.body.supplierReviewCount == null ? null : Number(req.body.supplierReviewCount),
+      priceRange: req.body.priceRange && typeof req.body.priceRange === 'object' ? {
+        low: req.body.priceRange.low == null || req.body.priceRange.low === '' ? null : Number.isFinite(Number(req.body.priceRange.low)) ? Number(req.body.priceRange.low) : null,
+        high: req.body.priceRange.high == null || req.body.priceRange.high === '' ? null : Number.isFinite(Number(req.body.priceRange.high)) ? Number(req.body.priceRange.high) : null,
+        currency: clean(req.body.priceRange.currency).toUpperCase().slice(0, 8),
+      } : null,
+      specifications: Array.isArray(req.body.specifications) ? req.body.specifications
+        .filter(item => item && typeof item === 'object' && clean(item.label) && clean(item.value))
+        .slice(0, 60).map(item => ({ label: clean(item.label).slice(0, 120), value: clean(item.value).slice(0, 500), source: clean(item.source).slice(0, 80) })) : [],
       verifiedFacts: Array.isArray(req.body.verifiedFacts) ? req.body.verifiedFacts.map(clean).filter(Boolean).slice(0, 30) : [],
-      variants: Array.isArray(req.body.variants) ? req.body.variants.filter(item => item && typeof item === 'object').slice(0, 30) : [],
+      variants: Array.isArray(req.body.variants) ? req.body.variants.filter(item => item && typeof item === 'object').slice(0, 30).map(item => ({
+        id: clean(item.id).slice(0, 160), name: clean(item.name).slice(0, 160), color: clean(item.color).slice(0, 100), size: clean(item.size).slice(0, 100),
+        attributes: item.attributes && typeof item.attributes === 'object' ? Object.fromEntries(Object.entries(item.attributes).slice(0, 20).map(([key, value]) => [clean(key).slice(0, 80), clean(value).slice(0, 160)])) : {},
+        image: clean(item.image || item.imageUrl), images: Array.isArray(item.images) ? item.images.map(clean).filter(Boolean).slice(0, 20) : [],
+        sku: clean(item.sku).slice(0, 160), barcode: clean(item.barcode || item.gtin).slice(0, 80),
+        price: item.price == null || item.price === '' ? null : Number(item.price), currency: clean(item.currency).toUpperCase().slice(0, 8),
+        supplierPrice: item.supplierPrice == null || item.supplierPrice === '' ? null : Number(item.supplierPrice),
+        supplierCurrency: clean(item.supplierCurrency).toUpperCase().slice(0, 8),
+        unitCost: item.unitCost == null || item.unitCost === '' ? null : Number(item.unitCost),
+        retailPrice: item.retailPrice == null || item.retailPrice === '' ? null : Number(item.retailPrice),
+        stock: item.stock == null || item.stock === '' ? null : Number(item.stock),
+      })) : [],
       unitCost: req.body.unitCost === '' || req.body.unitCost == null ? null : Number(req.body.unitCost),
       shippingStatus,
       shippingCost: shippingStatus === 'free' ? 0 : shippingStatus === 'paid' && req.body.shippingCost !== '' && req.body.shippingCost != null ? Number(req.body.shippingCost) : null,
@@ -1127,6 +1348,8 @@ export function createDropshipRouter({
     if (input.retailPrice !== null && (!Number.isFinite(input.retailPrice) || input.retailPrice <= 0)) return res.status(400).json({ success: false, error: 'Retail price must be a positive amount or left blank until costs are confirmed.' });
     if (input.availableStock !== null && (!Number.isInteger(input.availableStock) || input.availableStock < 0)) return res.status(400).json({ success: false, error: 'Available stock must be a whole number or left blank when unknown.' });
     if (input.shippingDays != null && (!Number.isFinite(input.shippingDays) || input.shippingDays < 0)) return res.status(400).json({ success: false, error: 'Shipping days must be zero or greater.' });
+    if (input.supplierRating != null && (!Number.isFinite(input.supplierRating) || input.supplierRating < 0 || input.supplierRating > 5)) return res.status(400).json({ success: false, error: 'Supplier listing ratings must be between 0 and 5.' });
+    if (input.supplierReviewCount != null && (!Number.isInteger(input.supplierReviewCount) || input.supplierReviewCount < 0)) return res.status(400).json({ success: false, error: 'Supplier listing review counts must be whole numbers greater than or equal to zero.' });
     if (input.unitCost !== null) {
       const shippingForPrice = input.shippingStatus === 'free' ? 0 : input.shippingStatus === 'paid' ? input.shippingCost : 0;
       input.retailPrice = recommendRetailPrice(input.unitCost, shippingForPrice);
@@ -1166,6 +1389,14 @@ export function createDropshipRouter({
       if (!candidate) return res.status(404).json({ success: false, error: 'Research candidate not found.' });
       if (!clean(candidate.productName) || !clean(candidate.category)) return res.status(422).json({ success: false, error: 'Set a product name and select a product category before creating its draft.' });
       const product = toProduct(candidate);
+      const variantShippingCost = candidate.shippingStatus === 'free' ? 0
+        : candidate.shippingStatus === 'paid' && Number.isFinite(Number(candidate.shippingCost)) ? Number(candidate.shippingCost)
+          : 0;
+      product.variants = product.variants.map(variant => {
+        if (variant.unitCost == null || !Number.isFinite(Number(variant.unitCost)) || Number(variant.unitCost) <= 0) return variant;
+        const recommended = recommendRetailPrice(Number(variant.unitCost), variantShippingCost);
+        return recommended == null ? variant : { ...variant, price: recommended, originalPrice: recommended };
+      });
       if (Number.isFinite(Number(candidate.unitCost)) && Number(candidate.unitCost) > 0) {
         const shippingForPrice = candidate.shippingStatus === 'free' ? 0
           : candidate.shippingStatus === 'paid' && Number.isFinite(Number(candidate.shippingCost)) ? Number(candidate.shippingCost)
