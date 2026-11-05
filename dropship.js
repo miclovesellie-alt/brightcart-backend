@@ -720,6 +720,12 @@ function recommendRetailPrice(unitCost, shippingCost, policy = pricePolicy()) {
   return Math.ceil(((unitCost + shippingCost) / denominator) / policy.roundingIncrement) * policy.roundingIncrement;
 }
 
+function compareAtPrice(sellingPrice) {
+  const price = Number(sellingPrice);
+  if (!Number.isFinite(price) || price <= 0) return null;
+  return Math.round(price * 150) / 100;
+}
+
 function parseProductHtml(html, finalUrl, destination) {
   const scripts = String(html || '').match(/<script\b[^>]*type\s*=\s*["']application\/ld\+json["'][^>]*>[\s\S]*?<\/script>/gi) || [];
   const nodes = [];
@@ -1393,9 +1399,12 @@ export function createDropshipRouter({
         : candidate.shippingStatus === 'paid' && Number.isFinite(Number(candidate.shippingCost)) ? Number(candidate.shippingCost)
           : 0;
       product.variants = product.variants.map(variant => {
-        if (variant.unitCost == null || !Number.isFinite(Number(variant.unitCost)) || Number(variant.unitCost) <= 0) return variant;
-        const recommended = recommendRetailPrice(Number(variant.unitCost), variantShippingCost);
-        return recommended == null ? variant : { ...variant, price: recommended, originalPrice: recommended };
+        let pricedVariant = variant;
+        if (variant.unitCost != null && Number.isFinite(Number(variant.unitCost)) && Number(variant.unitCost) > 0) {
+          const recommended = recommendRetailPrice(Number(variant.unitCost), variantShippingCost);
+          if (recommended != null) pricedVariant = { ...variant, price: recommended };
+        }
+        return { ...pricedVariant, originalPrice: compareAtPrice(pricedVariant.price) };
       });
       if (Number.isFinite(Number(candidate.unitCost)) && Number(candidate.unitCost) > 0) {
         const shippingForPrice = candidate.shippingStatus === 'free' ? 0
@@ -1404,9 +1413,9 @@ export function createDropshipRouter({
         const recommended = recommendRetailPrice(Number(candidate.unitCost), shippingForPrice);
         if (recommended !== null) {
           product.price = recommended;
-          product.originalPrice = recommended;
         }
       }
+      product.originalPrice = compareAtPrice(product.price);
       const duplicate = await findProduct(product.sku, product.name);
       if (duplicate && !req.body.updateExisting) return res.status(409).json({ success: false, duplicate: { id: duplicate.id, name: duplicate.name, status: duplicate.status }, error: 'A matching product already exists. Review it in Admin > Products before choosing an update.' });
       if (duplicate && req.body.updateExisting && duplicate.status !== 'Draft') return res.status(409).json({ success: false, duplicate: { id: duplicate.id, name: duplicate.name, status: duplicate.status || 'Active' }, error: 'Research imports can update drafts only. Edit a live product directly in Admin > Products.' });

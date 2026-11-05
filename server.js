@@ -98,13 +98,8 @@ const productSchema = new mongoose.Schema({
   cost: Number,
   status: { type: String, enum: ['Active', 'Draft', 'Out of Stock'], default: 'Active' },
   supplier: String,
-  brand: String,
-  barcode: String,
-  mpn: String,
-  availability: String,
   supplierDetails: mongoose.Schema.Types.Mixed,
   variants: [mongoose.Schema.Types.Mixed],
-  specifications: { type: [mongoose.Schema.Types.Mixed], default: [] },
   verifiedFacts: [String],
   policyReviewed: { type: Boolean, default: false },
   inventoryVerified: { type: Boolean, default: false },
@@ -159,7 +154,6 @@ const userSchema = new mongoose.Schema({
   status: { type: String, default: 'Active' },
   phone: String,
   country: String,
-  wishlistProductIds: { type: [Number], default: [] },
 }, { timestamps: true });
 
 const storeSettingsSchema = new mongoose.Schema({
@@ -194,25 +188,11 @@ const notificationSchema = new mongoose.Schema({
 }, { timestamps: true });
 notificationSchema.index({ recipientId: 1, audience: 1, createdAt: -1 });
 
-const reviewSchema = new mongoose.Schema({
-  productId: { type: Number, required: true, index: true },
-  orderId: { type: String, required: true },
-  customerUserId: { type: String, required: true, index: true },
-  customerName: { type: String, required: true, maxlength: 80 },
-  rating: { type: Number, required: true, min: 1, max: 5 },
-  title: { type: String, required: true, maxlength: 100 },
-  body: { type: String, required: true, maxlength: 1500 },
-  status: { type: String, enum: ['pending', 'approved', 'rejected'], default: 'pending', index: true },
-  moderatedBy: String,
-}, { timestamps: true });
-reviewSchema.index({ productId: 1, customerUserId: 1 }, { unique: true });
-
 const Product = mongoose.model('Product', productSchema);
 const Order = mongoose.model('Order', orderSchema);
 const User = mongoose.model('User', userSchema);
 const StoreSettings = mongoose.model('StoreSettings', storeSettingsSchema);
 const Notification = mongoose.model('Notification', notificationSchema);
-const ProductReview = mongoose.model('ProductReview', reviewSchema);
 let memoryStoreSettings = JSON.parse(JSON.stringify(DEFAULT_STORE_SETTINGS));
 
 // Initial Products Data
@@ -220,7 +200,6 @@ let memoryStoreSettings = JSON.parse(JSON.stringify(DEFAULT_STORE_SETTINGS));
 const LEGACY_SAMPLE_PRODUCT_IDS = Array.from({ length: 34 }, (_, index) => index + 1);
 const memoryProducts = [];
 const memoryNotifications = [];
-const memoryReviews = [];
 
 function isSampleProduct(product) {
   return product?.isSample === true
@@ -273,7 +252,6 @@ function publicUser(user) {
     status: user.status,
     phone: user.phone || '',
     country: user.country || '',
-    wishlistProductIds: Array.isArray(user.wishlistProductIds) ? user.wishlistProductIds : [],
   };
 }
 
@@ -453,38 +431,6 @@ async function getAllOrders() {
   return memoryOrders.map(({ paymentAuthorizationUrl: _paymentAuthorizationUrl, checkoutRequestId: _checkoutRequestId, ...order }) => order);
 }
 
-async function getProductReviews(productId, includePrivate = false, max = 100) {
-  const query = { productId: Number(productId) };
-  if (!includePrivate) query.status = 'approved';
-  if (mongoose.connection.readyState === 1) {
-    const request = ProductReview.find(query).sort({ createdAt: -1 });
-    if (max > 0) request.limit(max);
-    return request.lean();
-  }
-  const items = memoryReviews.filter(review => Number(review.productId) === Number(productId) && (includePrivate || review.status === 'approved'))
-    .sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt));
-  return max > 0 ? items.slice(0, max) : items;
-}
-
-function publicVariant(variant) {
-  if (!variant || typeof variant !== 'object') return variant;
-  const { unitCost, supplierPrice, supplierCurrency, ...safeVariant } = variant;
-  if (safeVariant.attributes && typeof safeVariant.attributes === 'object') {
-    safeVariant.attributes = Object.fromEntries(Object.entries(safeVariant.attributes)
-      .filter(([key]) => !/(?:cost|price|supplier|margin|profit|currency)/i.test(key))
-      .slice(0, 20));
-  }
-  return safeVariant;
-}
-
-async function updateProductReviewSummary(productId) {
-  const approved = await getProductReviews(productId, false, 0);
-  const product = await findProduct(null, null, Number(productId));
-  if (!product) return;
-  const rating = approved.length ? Math.round((approved.reduce((sum, item) => sum + Number(item.rating || 0), 0) / approved.length) * 10) / 10 : 0;
-  await saveProduct({ ...product, rating, reviews: approved.length }, Number(productId));
-}
-
 async function findOrder(id) {
   const normalized = String(id);
   if (mongoose.connection.readyState === 1) return Order.findOne({ id: normalized });
@@ -520,7 +466,7 @@ async function saveOrder(order) {
 }
 
 const notificationPages = new Set([
-  'account', 'admin-orders', 'admin-products', 'admin-dropshipping', 'admin-dashboard', 'admin-reviews',
+  'account', 'admin-orders', 'admin-products', 'admin-dropshipping', 'admin-dashboard',
 ]);
 
 function publicNotification(notification) {
@@ -976,71 +922,12 @@ app.get('/api/products', async (_req, res) => {
       .sort((a, b) => Number(a.id) - Number(b.id))
       .map(product => {
         const { cost, supplier, supplierDetails, verifiedFacts, policyReviewed, inventoryVerified, researchId, ...publicProduct } = product.toObject ? product.toObject() : product;
-        publicProduct.variants = Array.isArray(publicProduct.variants) ? publicProduct.variants.map(publicVariant) : [];
         delete publicProduct.isSample;
         return publicProduct;
       });
     res.json({ success: true, count: items.length, data: items });
   } catch (error) {
     res.status(500).json({ success: false, error: error.message });
-  }
-});
-
-app.get('/api/products/:id/reviews', async (req, res) => {
-  const productId = Number(req.params.id);
-  if (!Number.isSafeInteger(productId) || productId < 1) return res.status(400).json({ success: false, error: 'Invalid product ID.' });
-  try {
-    const product = await findProduct(null, null, productId);
-    if (!product || product.status === 'Draft' || product.status === 'Out of Stock') return res.status(404).json({ success: false, error: 'Product not found.' });
-    const reviews = await getProductReviews(productId);
-    res.json({ success: true, count: reviews.length, data: reviews.map(({ customerUserId, orderId, moderatedBy, ...review }) => review) });
-  } catch (error) {
-    res.status(500).json({ success: false, error: 'Could not load product reviews.' });
-  }
-});
-
-app.post('/api/products/:id/reviews', authenticate, async (req, res) => {
-  const productId = Number(req.params.id);
-  const rating = Number(req.body.rating);
-  const title = String(req.body.title || '').trim();
-  const body = String(req.body.body || '').trim();
-  const orderId = String(req.body.orderId || '').trim();
-  if (!Number.isSafeInteger(productId) || productId < 1) return res.status(400).json({ success: false, error: 'Invalid product ID.' });
-  if (req.user.role !== 'customer') return res.status(403).json({ success: false, error: 'Only customer accounts can submit product reviews.' });
-  if (!Number.isInteger(rating) || rating < 1 || rating > 5 || !title || title.length > 100 || body.length < 10 || body.length > 1500 || !orderId) {
-    return res.status(400).json({ success: false, error: 'Provide a 1–5 star rating, a short title, a review of at least 10 characters, and the order being reviewed.' });
-  }
-  try {
-    const product = await findProduct(null, null, productId);
-    if (!product || product.status === 'Draft') return res.status(404).json({ success: false, error: 'Product not found.' });
-    const customerUserId = String(req.user._id || req.user.id);
-    const order = (await getAllOrders()).find(item => String(item.id) === orderId && String(item.customerUserId || '') === customerUserId && item.paymentStatus === 'paid' && !['cancelled', 'canceled', 'refunded'].includes(String(item.status || '').toLowerCase()));
-    const purchased = order?.items?.some(item => Number(item.product?.id ?? item.productId) === productId);
-    if (!purchased) return res.status(403).json({ success: false, error: 'Reviews require a verified paid order containing this product.' });
-    const duplicate = mongoose.connection.readyState === 1
-      ? await ProductReview.exists({ productId, customerUserId })
-      : memoryReviews.some(review => Number(review.productId) === productId && review.customerUserId === customerUserId);
-    if (duplicate) return res.status(409).json({ success: false, error: 'You have already submitted a review for this product.' });
-    const displayName = String(req.user.name || 'Shopper').trim().split(/\s+/);
-    const customerName = displayName.length > 1 ? `${displayName[0]} ${displayName[displayName.length - 1].slice(0, 1)}.` : displayName[0];
-    const review = {
-      productId, orderId, customerUserId, customerName: customerName.slice(0, 80), rating,
-      title: title.slice(0, 100), body: body.slice(0, 1500), status: 'pending',
-    };
-    let saved;
-    if (mongoose.connection.readyState === 1) saved = await ProductReview.create(review);
-    else {
-      saved = { ...review, _id: crypto.randomUUID(), createdAt: new Date(), updatedAt: new Date() };
-      memoryReviews.unshift(saved);
-    }
-    await notifyAdmins({
-      type: 'product_review_pending', title: 'Product review needs approval',
-      message: `A verified buyer reviewed ${product.name}.`, page: 'admin-reviews', params: { reviewId: String(saved._id) },
-    }, ['super_admin', 'admin', 'moderator']);
-    res.status(201).json({ success: true, data: { id: String(saved._id), status: saved.status, message: 'Your review was sent for approval.' } });
-  } catch (error) {
-    if (error?.code === 11000) return res.status(409).json({ success: false, error: 'You have already submitted a review for this product.' });
-    res.status(500).json({ success: false, error: 'Could not save your review.' });
   }
 });
 
@@ -1144,40 +1031,6 @@ app.post('/api/admin/store-settings/test-email', authenticate, storeSettingsAdmi
 app.get('/api/admin/products', authenticate, editorRoles, async (_req, res) => {
   try { res.json({ success: true, data: (await getAllProducts()).sort((a, b) => Number(b.id) - Number(a.id)) }); }
   catch (error) { res.status(500).json({ success: false, error: error.message }); }
-});
-
-app.get('/api/admin/reviews', authenticate, adminRoles, async (req, res) => {
-  try {
-    const status = ['pending', 'approved', 'rejected'].includes(req.query.status) ? req.query.status : 'all';
-    const reviews = mongoose.connection.readyState === 1
-      ? await ProductReview.find(status === 'all' ? {} : { status }).sort({ createdAt: -1 }).limit(500).lean()
-      : memoryReviews.filter(review => status === 'all' || review.status === status).slice(0, 500);
-    const products = await getAllProducts();
-    const productNames = new Map(products.map(product => [Number(product.id), product.name]));
-    res.json({ success: true, data: reviews.map(review => ({ ...review, productName: productNames.get(Number(review.productId)) || 'Deleted product' })) });
-  } catch (error) {
-    res.status(500).json({ success: false, error: 'Could not load product reviews.' });
-  }
-});
-
-app.patch('/api/admin/reviews/:id', authenticate, adminRoles, async (req, res) => {
-  const status = String(req.body.status || '').toLowerCase();
-  if (!['approved', 'rejected'].includes(status)) return res.status(400).json({ success: false, error: 'Choose approved or rejected.' });
-  try {
-    let review;
-    if (mongoose.connection.readyState === 1) {
-      if (!mongoose.isValidObjectId(req.params.id)) return res.status(404).json({ success: false, error: 'Review not found.' });
-      review = await ProductReview.findByIdAndUpdate(req.params.id, { $set: { status, moderatedBy: String(req.user.email || '') } }, { new: true, runValidators: true }).lean();
-    } else {
-      review = memoryReviews.find(item => String(item._id) === req.params.id);
-      if (review) { review.status = status; review.moderatedBy = String(req.user.email || ''); review.updatedAt = new Date(); }
-    }
-    if (!review) return res.status(404).json({ success: false, error: 'Review not found.' });
-    await updateProductReviewSummary(review.productId);
-    res.json({ success: true, data: review });
-  } catch (error) {
-    res.status(500).json({ success: false, error: 'Could not update review moderation.' });
-  }
 });
 
 app.post('/api/admin/products', authenticate, editorRoles, async (req, res) => {
@@ -1316,25 +1169,18 @@ async function createOrderRecord(input = {}, payment = {}, customerUserId = '') 
       if (requested > Number(storedProduct.stock)) throw requestError(409, 'There is not enough stock for this product.');
     }
     const { cost, supplier, supplierDetails, verifiedFacts, policyReviewed, inventoryVerified, researchId, ...safeProductBase } = storedProduct;
-    safeProductBase.variants = Array.isArray(safeProductBase.variants) ? safeProductBase.variants.map(publicVariant) : [];
     const safeVariant = chosenVariant ? {
       id: String(chosenVariant.id || chosenVariant.color || chosenVariant.name || ''),
       name: String(chosenVariant.name || chosenVariant.color || ''),
       color: String(chosenVariant.color || chosenVariant.name || ''),
-      size: String(chosenVariant.size || ''),
-      attributes: chosenVariant.attributes && typeof chosenVariant.attributes === 'object' ? chosenVariant.attributes : {},
       image: String(chosenVariant.image || chosenVariant.imageUrl || ''),
       images: Array.isArray(chosenVariant.images) ? chosenVariant.images.filter(value => typeof value === 'string').slice(0, 20) : [],
       sku: String(chosenVariant.sku || ''),
-      price: chosenVariant.price != null && Number.isFinite(Number(chosenVariant.price)) ? Number(chosenVariant.price) : null,
-      originalPrice: chosenVariant.originalPrice != null && Number.isFinite(Number(chosenVariant.originalPrice)) ? Number(chosenVariant.originalPrice) : null,
     } : null;
     const safeProduct = safeVariant ? {
       ...safeProductBase,
       image: safeVariant.image || safeProductBase.image,
       images: safeVariant.images.length ? safeVariant.images : safeProductBase.images,
-      price: safeVariant.price != null ? safeVariant.price : safeProductBase.price,
-      originalPrice: safeVariant.originalPrice != null ? safeVariant.originalPrice : safeProductBase.originalPrice,
     } : safeProductBase;
     const supplierUnitCost = supplierDetails?.unitCost ?? cost;
     const shippingStatus = supplierDetails?.shippingStatus;
@@ -1515,40 +1361,6 @@ app.get('/api/account/orders', authenticate, async (req, res) => {
     const orders = (await getAllOrders()).filter(order => String(order.customerUserId || '') === userId);
     res.json({ success: true, data: orders.map(order => ({ ...order, items: (order.items || []).map(item => ({ ...item, supplierCost: undefined, supplierName: undefined })) })) });
   } catch (error) { res.status(500).json({ success: false, error: error.message }); }
-});
-
-app.get('/api/account/wishlist', authenticate, (req, res) => {
-  res.json({ success: true, data: Array.isArray(req.user.wishlistProductIds) ? req.user.wishlistProductIds : [] });
-});
-
-app.get('/api/account/reviews', authenticate, async (req, res) => {
-  try {
-    const query = { customerUserId: String(req.user._id || req.user.id) };
-    const productId = Number(req.query.productId);
-    if (req.query.productId && Number.isSafeInteger(productId) && productId > 0) query.productId = productId;
-    const reviews = mongoose.connection.readyState === 1
-      ? await ProductReview.find(query).sort({ createdAt: -1 }).limit(200).lean()
-      : memoryReviews.filter(review => review.customerUserId === query.customerUserId && (!query.productId || Number(review.productId) === query.productId)).slice(0, 200);
-    res.json({ success: true, data: reviews.map(({ customerUserId, ...review }) => review) });
-  } catch (error) {
-    res.status(500).json({ success: false, error: 'Could not load your reviews.' });
-  }
-});
-
-app.put('/api/account/wishlist', authenticate, async (req, res) => {
-  if (req.user.role !== 'customer') return res.status(403).json({ success: false, error: 'Only customer accounts have a saved-items list.' });
-  const incoming = Array.isArray(req.body.productIds) ? req.body.productIds : null;
-  if (!incoming || incoming.length > 200) return res.status(400).json({ success: false, error: 'Saved items must contain no more than 200 product IDs.' });
-  const ids = [...new Set(incoming.map(Number))];
-  if (ids.some(id => !Number.isSafeInteger(id) || id < 1)) return res.status(400).json({ success: false, error: 'Saved item IDs must be valid product IDs.' });
-  try {
-    const availableIds = new Set((await getAllProducts()).filter(product => !isSampleProduct(product) && product.status !== 'Draft' && product.status !== 'Out of Stock').map(product => Number(product.id)));
-    req.user.wishlistProductIds = ids.filter(id => availableIds.has(id));
-    await saveUser(req.user);
-    res.json({ success: true, data: req.user.wishlistProductIds });
-  } catch (error) {
-    res.status(500).json({ success: false, error: 'Could not save your items.' });
-  }
 });
 
 app.post('/api/payments/paystack/webhook', async (req, res) => {
