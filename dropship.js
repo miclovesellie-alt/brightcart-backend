@@ -254,8 +254,12 @@ function toProduct(candidate) {
   };
 }
 
-const MAX_PRODUCT_PAGE_BYTES = 1_500_000;
-const MAX_PRODUCT_PAGE_REDIRECTS = 4;
+const MAX_PRODUCT_PAGE_BYTES = 5_000_000;
+const MAX_PRODUCT_PAGE_REDIRECTS = 5;
+const MAX_PRODUCT_PAGE_ADDRESSES = 3;
+const CJ_API_BASE = 'https://developers.cjdropshipping.com/api2.0/v1';
+let cjTokenCache = null;
+let cjTokenPromise = null;
 
 function isPrivateIpv4(address) {
   const parts = address.split('.').map(Number);
@@ -301,18 +305,23 @@ async function validateProductPageUrl(raw) {
   return { url, addresses };
 }
 
-function fetchPinnedProductPage(url, addresses) {
+function fetchPinnedProductPage(url, address) {
   return new Promise((resolve, reject) => {
-    const pinned = addresses[0];
+    const pinned = address;
     const request = https.request(url, {
       method: 'GET',
       servername: url.hostname,
-      timeout: 12_000,
+      timeout: 20_000,
       lookup: (_hostname, options, callback) => {
         if (options?.all) return callback(null, [{ address: pinned.address, family: pinned.family || isIP(pinned.address) }]);
         return callback(null, pinned.address, pinned.family || isIP(pinned.address));
       },
-      headers: { 'User-Agent': 'BrightcartProductResearch/1.0', Accept: 'text/html,application/xhtml+xml' },
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
+        Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
+        'Accept-Language': 'en-US,en;q=0.9',
+        'Cache-Control': 'no-cache',
+      },
     }, response => {
       const status = Number(response.statusCode || 0);
       const contentType = String(response.headers['content-type'] || '').toLowerCase();
@@ -353,15 +362,27 @@ function fetchPinnedProductPage(url, addresses) {
   });
 }
 
+async function requestPublicProductPage(url, addresses) {
+  let lastError;
+  for (const address of addresses.slice(0, MAX_PRODUCT_PAGE_ADDRESSES)) {
+    try { return await fetchPinnedProductPage(url, address); }
+    catch (error) { lastError = error; }
+  }
+  throw lastError || new Error('The supplier host did not return a response.');
+}
+
 async function fetchProductPage(raw) {
   let { url, addresses } = await validateProductPageUrl(raw);
   for (let redirects = 0; redirects <= MAX_PRODUCT_PAGE_REDIRECTS; redirects += 1) {
-    const response = await fetchPinnedProductPage(url, addresses);
+    const response = await requestPublicProductPage(url, addresses);
     if ([301, 302, 303, 307, 308].includes(response.status)) {
       const location = response.headers.location;
       if (!location || redirects === MAX_PRODUCT_PAGE_REDIRECTS) throw new Error('The supplier page redirected too many times.');
       ({ url, addresses } = await validateProductPageUrl(new URL(location, url).toString()));
       continue;
+    }
+    if ([401, 403, 429].includes(response.status)) {
+      throw new Error(`The supplier denied automated page access (HTTP ${response.status}). Try the public product URL or enter the verified product details manually.`);
     }
     if (response.status < 200 || response.status >= 300) throw new Error(`Supplier page returned HTTP ${response.status}.`);
     const type = String(response.headers['content-type'] || '').toLowerCase();
@@ -371,6 +392,58 @@ async function fetchProductPage(raw) {
     return { html: response.html, finalUrl: url.toString() };
   }
   throw new Error('Could not follow the supplier page redirect.');
+}
+
+async function getCJAccessToken() {
+  const apiKey = clean(process.env.CJ_API_KEY);
+  if (!apiKey) return null;
+  const keyFingerprint = crypto.createHash('sha256').update(apiKey).digest('hex');
+  if (cjTokenCache?.keyFingerprint === keyFingerprint && cjTokenCache.expiresAt > Date.now() + 60_000) return cjTokenCache.token;
+  if (cjTokenPromise) return cjTokenPromise;
+
+  cjTokenPromise = (async () => {
+    const response = await fetch(`${CJ_API_BASE}/authentication/getAccessToken`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ apiKey }),
+      redirect: 'error',
+      signal: AbortSignal.timeout(15_000),
+    });
+    const payload = await response.json().catch(() => null);
+    const token = clean(payload?.data?.accessToken);
+    if (!response.ok || payload?.result === false || payload?.success === false || !token) {
+      const detail = clean(payload?.message);
+      throw new Error(`CJ API authentication failed${response.status ? ` (HTTP ${response.status})` : ''}${detail ? `: ${detail}` : '.'}`);
+    }
+    const expiresAt = Date.parse(payload.data.accessTokenExpiryDate);
+    cjTokenCache = {
+      token,
+      keyFingerprint,
+      expiresAt: Number.isFinite(expiresAt) ? expiresAt : Date.now() + 12 * 60 * 60 * 1000,
+    };
+    return token;
+  })();
+
+  try { return await cjTokenPromise; }
+  finally { cjTokenPromise = null; }
+}
+
+async function getCJProductDetails(productId) {
+  const token = await getCJAccessToken();
+  if (!token) return null;
+  const response = await fetch(`${CJ_API_BASE}/product/productDetail/query`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'CJ-Access-Token': token },
+    body: JSON.stringify({ id: productId }),
+    redirect: 'error',
+    signal: AbortSignal.timeout(20_000),
+  });
+  const payload = await response.json().catch(() => null);
+  if (!response.ok || payload?.result === false || payload?.success === false || !payload?.data) {
+    const detail = clean(payload?.message);
+    throw new Error(`CJ product lookup failed${response.status ? ` (HTTP ${response.status})` : ''}${detail ? `: ${detail}` : '.'}`);
+  }
+  return payload.data;
 }
 
 function decodeHtml(value) {
@@ -398,6 +471,11 @@ function pageMeta(html, key) {
     if ([attrs.property, attrs.name, attrs.itemprop].some(value => value?.toLowerCase() === wanted)) return attrs.content || '';
   }
   return '';
+}
+
+function pageHeading(html) {
+  const heading = String(html || '').match(/<h1\b[^>]*>([\s\S]*?)<\/h1>/i)?.[1] || '';
+  return decodeHtml(heading.replace(/<[^>]*>/g, ' ')).replace(/\s+/g, ' ').trim();
 }
 
 function absolutePublicWebUrl(value, base) {
@@ -439,7 +517,7 @@ function productImages(product, html, baseUrl) {
     const url = absolutePublicWebUrl(source, baseUrl);
     if (url) images.push(url);
   }
-  for (const value of [pageMeta(html, 'og:image'), pageMeta(html, 'twitter:image')]) {
+  for (const value of [pageMeta(html, 'og:image'), pageMeta(html, 'twitter:image'), pageMeta(html, 'image')]) {
     const url = absolutePublicWebUrl(value, baseUrl);
     if (url) images.push(url);
   }
@@ -550,11 +628,14 @@ function parseProductHtml(html, finalUrl, destination) {
   const pageTitle = pageMeta(html, 'og:title')
     || pageMeta(html, 'twitter:title')
     || decodeHtml(String(html || '').match(/<title\b[^>]*>([\s\S]*?)<\/title>/i)?.[1] || '').replace(/<[^>]+>/g, '').trim();
-  const productName = clean(product.name || product.alternateName || pageTitle);
-  const description = clean(product.description || pageMeta(html, 'og:description') || pageMeta(html, 'description'));
+  if (!products.length && /^(?:just a moment|attention required|access denied|verify you are human|request blocked|captcha)/i.test(pageTitle.trim())) {
+    throw new Error('The supplier returned a bot check instead of its product page. Try its public canonical URL or enter the verified product details manually.');
+  }
+  const productName = clean(product.name || product.alternateName || pageMeta(html, 'name') || pageHeading(html) || pageTitle).replace(/\s+/g, ' ');
+  const description = clean(product.description || pageMeta(html, 'og:description') || pageMeta(html, 'description')).replace(/\s+/g, ' ');
   const supplierName = clean(pageMeta(html, 'og:site_name')) || new URL(finalUrl).hostname.replace(/^www\./i, '');
-  const brand = clean(typeof product.brand === 'string' ? product.brand : product.brand?.name);
-  const categoryRaw = clean(product.category || pageMeta(html, 'product:category'));
+  const brand = clean(typeof product.brand === 'string' ? product.brand : product.brand?.name || pageMeta(html, 'brand'));
+  const categoryRaw = clean(product.category || pageMeta(html, 'product:category') || pageMeta(html, 'category'));
   let offer = productOffer(product);
   if (!offer.price) {
     const metaPrice = pageMeta(html, 'product:price:amount') || pageMeta(html, 'og:price:amount') || pageMeta(html, 'price');
@@ -568,9 +649,11 @@ function parseProductHtml(html, finalUrl, destination) {
   if (description) facts.push(description);
   if (brand) facts.push(`Brand: ${brand}`);
   if (categoryRaw) facts.push(`Supplier category: ${categoryRaw}`);
-  if (clean(product.sku)) facts.push(`Supplier SKU: ${clean(product.sku)}`);
-  if (product.color) facts.push(`Listed color: ${clean(product.color)}`);
-  const availability = clean(offer.offer?.availability);
+  const sku = clean(product.sku || pageMeta(html, 'sku'));
+  if (sku) facts.push(`Supplier SKU: ${sku}`);
+  const color = clean(product.color || pageMeta(html, 'color'));
+  if (color) facts.push(`Listed color: ${color}`);
+  const availability = clean(offer.offer?.availability || pageMeta(html, 'availability'));
   if (availability) facts.push(`Supplier listing availability: ${availability.split('/').pop().replace(/([A-Z])/g, ' $1').trim()}.`);
   for (const prop of Array.isArray(product.additionalProperty) ? product.additionalProperty : []) {
     const name = clean(prop.name);
@@ -620,6 +703,146 @@ function parseProductHtml(html, finalUrl, destination) {
     missingSignals,
     pricingPolicy: pricePolicy(),
   };
+}
+
+function cjdropshippingProductId(rawUrl) {
+  let url;
+  try { url = new URL(rawUrl); } catch { return null; }
+  const host = url.hostname.toLowerCase();
+  if (!['https:', 'http:'].includes(url.protocol)
+    || !(host === 'cjdropshipping.com' || host.endsWith('.cjdropshipping.com') || host === 'cjdropshipping.cn' || host.endsWith('.cjdropshipping.cn'))) return null;
+  return url.searchParams.get('pid')
+    || url.searchParams.get('productId')
+    || url.pathname.match(/-p-(\d+)(?:\.html)?\/?$/i)?.[1]
+    || null;
+}
+
+function parseCJPrice(value) {
+  if (typeof value === 'number') return Number.isFinite(value) && value > 0 ? value : null;
+  const text = clean(value).replace(/,/g, '');
+  const parts = text.match(/\d+(?:\.\d+)?/g) || [];
+  const amounts = parts.map(Number).filter(amount => Number.isFinite(amount) && amount > 0);
+  return amounts.length ? Math.min(...amounts) : null;
+}
+
+function parseCJProductDetails(data, finalUrl, destination) {
+  const dimensionLabels = clean(data.variantkeyen || data.variantKeyEn || data.variantKey || '')
+    .toLowerCase().split(/[,|/\-]+/).map(value => value.trim()).filter(Boolean);
+  const colorIndex = dimensionLabels.findIndex(value => /^(?:colour|color)(?:\s|$)/.test(value));
+  const rawVariants = Array.isArray(data.stanProducts) ? data.stanProducts
+    : Array.isArray(data.variants) ? data.variants : [];
+  const variants = rawVariants.map((item, index) => {
+    const key = clean(item.variantkey || item.variantKey || item.variantStandard || item.variantNameEn || '');
+    const values = key.split(/[-,|/]+/).map(value => value.trim()).filter(Boolean);
+    const color = clean(item.color || item.colour || (colorIndex >= 0 ? values[colorIndex] : ''));
+    if (!color) return null;
+    const image = absolutePublicWebUrl(item.variantImage || item.img || item.image, finalUrl);
+    const price = parseCJPrice(item.variantSellPrice ?? item.sellprice ?? item.sellPrice ?? item.price);
+    return {
+      id: clean(item.vid || item.id || item.variantSku || item.sku) || `${color}-${index + 1}`,
+      name: color,
+      color,
+      image,
+      images: image ? [image] : [],
+      sku: clean(item.variantSku || item.sku),
+      price,
+      currency: 'USD',
+    };
+  }).filter(Boolean).slice(0, 30);
+
+  let imageValues = data.productImageSet || data.productImages || data.images || [];
+  if (typeof imageValues === 'string') {
+    try { imageValues = JSON.parse(imageValues); } catch { imageValues = imageValues.split(/[\n,]+/); }
+  }
+  if (!Array.isArray(imageValues)) imageValues = [imageValues];
+  const images = [...new Set([
+    data.bigimg || data.bigImage || data.image || '',
+    ...imageValues.map(item => typeof item === 'string' ? item : item?.url || item?.image || item?.bigimg || ''),
+    ...variants.map(item => item.image),
+  ].map(value => absolutePublicWebUrl(value, finalUrl)).filter(Boolean))].slice(0, 20);
+  const variantPrices = variants.map(item => item.price).filter(Number.isFinite).sort((left, right) => left - right);
+  const rawVendorPrice = data.sellprice || data.sellPrice || data.price;
+  const unitCost = variantPrices[0] || parseCJPrice(rawVendorPrice);
+  const productName = clean(data.productNameEn || data.nameEn || data.nameen || data.productName || data.name);
+  const categoryRaw = clean(data.categoryName || data.category || data.productTypeName);
+  const description = clean(data.description || data.descriptionEn || '').replace(/<script\b[^>]*>[\s\S]*?<\/script>/gi, ' ')
+    .replace(/<style\b[^>]*>[\s\S]*?<\/style>/gi, ' ').replace(/<[^>]*>/g, ' ').replace(/\s+/g, ' ').slice(0, 2400);
+  const facts = [];
+  if (description) facts.push(description);
+  if (categoryRaw) facts.push(`Supplier category: ${categoryRaw}`);
+  if (clean(data.sku || data.productSku)) facts.push(`Supplier SKU: ${clean(data.sku || data.productSku)}`);
+  if (unitCost != null && (/\d\s*[-–]\s*\d/.test(String(rawVendorPrice || '')) || variantPrices.length > 1)) {
+    facts.push('Vendor price is a range; the lowest listed amount is used as the draft cost. Confirm the selected variant price before approval.');
+  }
+  if (Number(data.addMarkStatus) === 1) facts.push('CJ marks this listing as free-shipping eligible; destination-specific freight still needs confirmation.');
+  const suggestedRetailPrice = unitCost ? recommendRetailPrice(unitCost, 0) : null;
+  const rawStock = data.availableStock ?? data.totalInventory;
+  const availableStockValue = rawStock == null || rawStock === '' ? Number.NaN : Number(rawStock);
+  const availableStock = Number.isInteger(availableStockValue) && availableStockValue >= 0 ? availableStockValue : null;
+  const missingSignals = [];
+  if (!unitCost) missingSignals.push('Supplier unit price');
+  if (!images.length) missingSignals.push('Product images');
+  if (!destination) missingSignals.push('Shipping destination country');
+  missingSignals.push('Shipping cost to the selected destination');
+  if (!suggestedRetailPrice) missingSignals.push('Retail price recommendation');
+  if (availableStock == null) missingSignals.push('Available stock quantity');
+  if (!variants.length) missingSignals.push('Color variants (none were returned by CJ)');
+  return {
+    productName,
+    category: normalizeCategory(categoryRaw),
+    supplierName: 'CJdropshipping',
+    supplierUrl: finalUrl,
+    sourceUrl: finalUrl,
+    description,
+    imageUrl: images[0] || '',
+    images,
+    unitCost,
+    currency: 'USD',
+    shippingStatus: 'unknown',
+    shippingCost: null,
+    shippingCurrency: 'USD',
+    shippingDestination: clean(destination).toUpperCase(),
+    shippingDays: null,
+    suggestedRetailPrice,
+    availableStock,
+    variants,
+    verifiedFacts: facts,
+    missingSignals,
+    pricingPolicy: pricePolicy(),
+  };
+}
+
+async function extractSupplierProduct(rawUrl, destination) {
+  const productId = cjdropshippingProductId(rawUrl);
+  const parsedUrl = (() => { try { return new URL(rawUrl); } catch { return null; } })();
+  let apiError = '';
+  if (productId && parsedUrl?.protocol === 'https:' && !parsedUrl.username && !parsedUrl.password && clean(process.env.CJ_API_KEY)) {
+    try {
+      const details = await getCJProductDetails(productId);
+      const extracted = parseCJProductDetails(details, parsedUrl.toString(), destination);
+      if (extracted.productName) return { data: extracted, source: parsedUrl.toString(), extractionMode: 'CJ official product API' };
+      apiError = 'CJ returned product details without a product name.';
+    } catch (error) {
+      apiError = error.message || 'CJ product lookup failed.';
+    }
+  }
+
+  try {
+    const { html, finalUrl } = await fetchProductPage(rawUrl);
+    const extracted = parseProductHtml(html, finalUrl, destination);
+    if (!extracted.productName) throw new Error('The page does not expose a product name. Enter verified product facts manually or use another source page.');
+    return {
+      data: extracted,
+      source: finalUrl,
+      extractionMode: 'public product-page metadata',
+      extractionWarning: apiError || (productId && !clean(process.env.CJ_API_KEY)
+        ? 'CJ_API_KEY is not configured; only public page metadata could be read.'
+        : ''),
+    };
+  } catch (error) {
+    if (apiError) throw new Error(`${apiError} Public product-page extraction also failed: ${error.message}`);
+    throw error;
+  }
 }
 
 function extractJsonObject(value) {
@@ -727,6 +950,7 @@ export function createDropshipRouter({
   findProduct,
   saveOrder,
   findOrder,
+  notifyAdmins = async () => {},
 }) {
   const router = express.Router();
   const extractRateLimit = rateLimit({ windowMs: 10 * 60_000, max: 12, keyPrefix: 'dropship-extract' });
@@ -734,11 +958,21 @@ export function createDropshipRouter({
   router.use(authenticate, requireAdmin);
 
   router.get('/connections', async (_req, res) => {
+    const cjConfigured = Boolean(clean(process.env.CJ_API_KEY));
     res.json({
       success: true,
       database: dbReady() ? 'connected' : 'memory only; records reset on server restart',
       publishingMode: 'Admin review required',
-      supplier: { connected: false, provider: null, automaticPurchasing: false, mode: 'Manual records only', setup: 'No official supplier API is configured. Add a provider adapter and server-side credentials before enabling stock sync or automatic ordering.' },
+      supplier: {
+        configured: cjConfigured,
+        connected: cjConfigured,
+        provider: cjConfigured ? 'CJ Dropshipping' : null,
+        automaticPurchasing: false,
+        mode: cjConfigured ? 'CJ product import; fulfillment remains manual' : 'Public product-page extraction',
+        setup: cjConfigured
+          ? 'CJ product URLs use the official product API. Shipping quotes, live stock checks, and supplier orders still require review or separate adapters.'
+          : 'Add CJ_API_KEY on the backend for reliable CJ product imports. Public HTML extraction remains available for other suppliers; pages with bot protection may need manual entry.',
+      },
       ai: await aiStatus(),
       pricing: pricePolicy(),
       payment: String(process.env.PAYSTACK_SECRET_KEY || '').trim()
@@ -843,14 +1077,15 @@ export function createDropshipRouter({
     const rawUrl = clean(req.body.url);
     const destination = clean(req.body.destinationCountry);
     try {
-      const { html, finalUrl } = await fetchProductPage(rawUrl);
-      const extracted = parseProductHtml(html, finalUrl, destination);
+      const extraction = await extractSupplierProduct(rawUrl, destination);
+      const extracted = extraction.data;
       if (!extracted.productName) return res.status(422).json({ success: false, error: 'The page does not expose a product name. Enter product facts manually or use another source page.' });
       res.json({
         success: true,
         data: extracted,
-        source: finalUrl,
-        extractionMode: 'public product metadata; dynamic-only supplier pages may need manual review',
+        source: extraction.source,
+        extractionMode: extraction.extractionMode,
+        extractionWarning: extraction.extractionWarning || '',
       });
     } catch (error) {
       res.status(422).json({ success: false, error: error.message || 'Could not extract the supplier page.' });
@@ -953,6 +1188,13 @@ export function createDropshipRouter({
       if (dbReady()) await Research.updateOne({ _id: candidate._id }, { $set: { state: 'imported' } });
       else candidate.state = 'imported';
       await writeActivity('product_imported', `Imported ${product.name} as a draft`, safeUser(req), saved.id, { researchId: String(candidate._id) });
+      await notifyAdmins({
+        type: 'dropship_draft_saved',
+        title: 'AI product draft saved',
+        message: `${saved.name} is ready for review in Product Studio.`,
+        page: 'admin-dropshipping',
+        params: { section: 'studio' },
+      }, ['super_admin', 'admin']);
       res.status(201).json({ success: true, data: saved, visibility: 'draft' });
     } catch (error) {
       res.status(500).json({ success: false, error: error.message });
@@ -981,6 +1223,13 @@ export function createDropshipRouter({
       if (missing.length) return res.status(422).json({ success: false, error: `Cannot publish yet. Complete: ${missing.join(', ')}.` });
       const saved = await saveProduct({ ...product, status: 'Active', policyReviewed: true, inventoryVerified: true, publishedAt: new Date() }, Number(req.params.id));
       await writeActivity('product_published', `Published ${saved.name} to the storefront`, safeUser(req), saved.id);
+      await notifyAdmins({
+        type: 'product_published',
+        title: 'Product published',
+        message: `${saved.name} is now available in the storefront.`,
+        page: 'admin-products',
+        params: { productId: saved.id },
+      }, ['super_admin', 'admin']);
       res.json({ success: true, data: saved });
     } catch (error) {
       res.status(500).json({ success: false, error: error.message });

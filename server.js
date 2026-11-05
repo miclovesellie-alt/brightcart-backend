@@ -175,16 +175,31 @@ const storeSettingsSchema = new mongoose.Schema({
   },
 }, { timestamps: true });
 
+const notificationSchema = new mongoose.Schema({
+  id: { type: String, required: true, unique: true },
+  recipientId: { type: String, required: true, index: true },
+  audience: { type: String, enum: ['admin', 'user'], required: true, index: true },
+  type: { type: String, required: true, maxlength: 60 },
+  title: { type: String, required: true, maxlength: 140 },
+  message: { type: String, required: true, maxlength: 320 },
+  page: { type: String, default: '' },
+  params: { type: mongoose.Schema.Types.Mixed, default: {} },
+  readAt: { type: Date, default: null },
+}, { timestamps: true });
+notificationSchema.index({ recipientId: 1, audience: 1, createdAt: -1 });
+
 const Product = mongoose.model('Product', productSchema);
 const Order = mongoose.model('Order', orderSchema);
 const User = mongoose.model('User', userSchema);
 const StoreSettings = mongoose.model('StoreSettings', storeSettingsSchema);
+const Notification = mongoose.model('Notification', notificationSchema);
 let memoryStoreSettings = JSON.parse(JSON.stringify(DEFAULT_STORE_SETTINGS));
 
 // Initial Products Data
 // IDs 1–34 belong to the original sample catalog. Keep them out of the live store.
 const LEGACY_SAMPLE_PRODUCT_IDS = Array.from({ length: 34 }, (_, index) => index + 1);
 const memoryProducts = [];
+const memoryNotifications = [];
 
 function isSampleProduct(product) {
   return product?.isSample === true
@@ -450,6 +465,71 @@ async function saveOrder(order) {
   return order;
 }
 
+const notificationPages = new Set([
+  'account', 'admin-orders', 'admin-products', 'admin-dropshipping', 'admin-dashboard',
+]);
+
+function publicNotification(notification) {
+  return {
+    id: String(notification.id),
+    type: String(notification.type || ''),
+    title: String(notification.title || ''),
+    message: String(notification.message || ''),
+    page: String(notification.page || ''),
+    params: notification.params && typeof notification.params === 'object' && !Array.isArray(notification.params) ? notification.params : {},
+    readAt: notification.readAt || null,
+    createdAt: notification.createdAt || null,
+  };
+}
+
+async function createNotification({ recipientId, audience, type, title, message, page = '', params = {} }) {
+  const safeRecipientId = String(recipientId || '').trim();
+  if (!safeRecipientId || !['admin', 'user'].includes(audience)) return null;
+  const entry = {
+    id: crypto.randomUUID(),
+    recipientId: safeRecipientId,
+    audience,
+    type: String(type || 'update').slice(0, 60),
+    title: String(title || 'Store update').slice(0, 140),
+    message: String(message || '').slice(0, 320),
+    page: notificationPages.has(String(page)) ? String(page) : '',
+    params: params && typeof params === 'object' && !Array.isArray(params) ? params : {},
+    readAt: null,
+  };
+  if (mongoose.connection.readyState === 1) {
+    const saved = await Notification.create(entry);
+    return saved.toObject();
+  }
+  memoryNotifications.unshift({ ...entry, createdAt: new Date() });
+  if (memoryNotifications.length > 3000) memoryNotifications.length = 3000;
+  return memoryNotifications[0];
+}
+
+async function notifyAdmins(notification, roles = ['super_admin', 'admin', 'moderator']) {
+  try {
+    const recipients = mongoose.connection.readyState === 1
+      ? await User.find({ role: { $in: roles }, status: 'Active' }).select('_id').lean()
+      : [...memoryUsers.values()].filter(user => roles.includes(user.role) && user.status === 'Active');
+    await Promise.all(recipients.map(user => createNotification({
+      ...notification,
+      audience: 'admin',
+      recipientId: String(user._id || user.id),
+    })));
+  } catch (error) {
+    console.error('Could not create admin in-app notification:', error.message);
+  }
+}
+
+async function notifyCustomer(order, notification) {
+  const recipientId = String(order?.customerUserId || '').trim();
+  if (!recipientId) return;
+  try {
+    await createNotification({ ...notification, audience: 'user', recipientId });
+  } catch (error) {
+    console.error('Could not create customer in-app notification:', error.message);
+  }
+}
+
 function publicStoreSettings(settings = {}) {
   return {
     supportEmail: String(settings.supportEmail || ''),
@@ -674,6 +754,27 @@ async function markOrderPaymentVerified(order, source, notifyStatusChange = true
   return saved;
 }
 
+async function notifyOrderCreatedInApp(order) {
+  const itemCount = (order.items || []).reduce((sum, item) => sum + Number(item.qty || 0), 0);
+  const tasks = [notifyAdmins({
+    type: 'new_order',
+    title: 'New order received',
+    message: `${order.customer || 'A customer'} placed order ${order.id}.`,
+    page: 'admin-orders',
+    params: { orderId: String(order.id) },
+  })];
+  if (order.customerUserId) {
+    tasks.push(notifyCustomer(order, {
+      type: 'order_received',
+      title: 'Order received',
+      message: `Order ${order.id} with ${itemCount} item${itemCount === 1 ? '' : 's'} is now ${String(order.status || 'being processed').toLowerCase()}.`,
+      page: 'account',
+      params: { tab: 'orders' },
+    }));
+  }
+  await Promise.all(tasks);
+}
+
 async function notifyOrderCreated(order) {
   const settings = await getStoreSettings();
   const notifications = settings.notifications;
@@ -701,6 +802,13 @@ async function notifyOrderCreated(order) {
 }
 
 async function notifyOrderStatusChanged(order) {
+  await notifyCustomer(order, {
+    type: 'order_status',
+    title: 'Order update',
+    message: `Order ${order.id} is now ${order.status}.${order.tracking ? ` Tracking: ${order.tracking}.` : ''}`,
+    page: 'account',
+    params: { tab: 'orders' },
+  });
   const settings = await getStoreSettings();
   if (!settings.notifications.customerOrderStatus) return;
   try {
@@ -827,6 +935,66 @@ const adminRoles = requireRoles('super_admin', 'admin', 'moderator');
 const editorRoles = requireRoles('super_admin', 'admin');
 const storeSettingsAdmin = requireRoles('super_admin');
 
+function notificationScope(user) {
+  return {
+    audience: ['super_admin', 'admin', 'moderator'].includes(user?.role) ? 'admin' : 'user',
+    recipientId: String(user?._id || user?.id || ''),
+  };
+}
+
+app.get('/api/notifications', authenticate, async (req, res) => {
+  try {
+    const scope = notificationScope(req.user);
+    const limit = Math.min(50, Math.max(1, Number.parseInt(req.query.limit, 10) || 30));
+    const notifications = mongoose.connection.readyState === 1
+      ? await Notification.find(scope).sort({ createdAt: -1 }).limit(limit).lean()
+      : memoryNotifications.filter(item => item.audience === scope.audience && item.recipientId === scope.recipientId)
+        .sort((left, right) => new Date(right.createdAt).getTime() - new Date(left.createdAt).getTime()).slice(0, limit);
+    res.json({ success: true, data: notifications.map(publicNotification) });
+  } catch (error) { res.status(500).json({ success: false, error: 'Could not load notifications.' }); }
+});
+
+app.patch('/api/notifications/:id/read', authenticate, async (req, res) => {
+  try {
+    const scope = notificationScope(req.user);
+    const readAt = new Date();
+    let notification;
+    if (mongoose.connection.readyState === 1) {
+      notification = await Notification.findOneAndUpdate(
+        { id: String(req.params.id), ...scope },
+        { $set: { readAt } },
+        { new: true },
+      ).lean();
+    } else {
+      notification = memoryNotifications.find(item => item.id === String(req.params.id)
+        && item.audience === scope.audience && item.recipientId === scope.recipientId);
+      if (notification) notification.readAt = readAt;
+    }
+    if (!notification) return res.status(404).json({ success: false, error: 'Notification not found.' });
+    res.json({ success: true, data: publicNotification(notification) });
+  } catch { res.status(500).json({ success: false, error: 'Could not update this notification.' }); }
+});
+
+app.post('/api/notifications/read-all', authenticate, async (req, res) => {
+  try {
+    const scope = notificationScope(req.user);
+    const readAt = new Date();
+    let updated = 0;
+    if (mongoose.connection.readyState === 1) {
+      const result = await Notification.updateMany({ ...scope, readAt: null }, { $set: { readAt } });
+      updated = result.modifiedCount || 0;
+    } else {
+      for (const notification of memoryNotifications) {
+        if (notification.audience === scope.audience && notification.recipientId === scope.recipientId && !notification.readAt) {
+          notification.readAt = readAt;
+          updated += 1;
+        }
+      }
+    }
+    res.json({ success: true, updated });
+  } catch { res.status(500).json({ success: false, error: 'Could not mark notifications as read.' }); }
+});
+
 app.get('/api/admin/store-settings', authenticate, storeSettingsAdmin, async (_req, res) => {
   try {
     res.json({ success: true, data: await getStoreSettings(), email: emailProviderStatus() });
@@ -878,6 +1046,15 @@ app.post('/api/admin/products', authenticate, editorRoles, async (req, res) => {
     const data = { ...req.body, name, category, price, image: images[0] || '', images, id: Date.now(), status: ['Draft', 'Out of Stock'].includes(req.body.status) ? req.body.status : 'Active' };
     delete data.isSample;
     const created = await saveProduct(data);
+    if (created.status === 'Draft') {
+      await notifyAdmins({
+        type: 'product_draft_saved',
+        title: 'Product draft saved',
+        message: `${created.name} is ready for review in Product Studio.`,
+        page: 'admin-dropshipping',
+        params: { section: 'studio' },
+      }, ['super_admin', 'admin']);
+    }
     res.status(201).json({ success: true, data: created });
   } catch (error) { res.status(500).json({ success: false, error: error.message }); }
 });
@@ -887,9 +1064,11 @@ app.patch('/api/admin/products/:id', authenticate, editorRoles, async (req, res)
     const current = await findProduct(null, null, Number(req.params.id));
     if (!current) return res.status(404).json({ success: false, error: 'Product not found.' });
     const patch = { ...req.body };
+    const notifyDraftSaved = patch.notifyDraftSaved === true;
     delete patch.id;
     delete patch._id;
     delete patch.isSample;
+    delete patch.notifyDraftSaved;
     if (Object.prototype.hasOwnProperty.call(patch, 'images') || Object.prototype.hasOwnProperty.call(patch, 'image')) {
       const images = [...new Set((Array.isArray(patch.images) ? patch.images : [patch.image ?? current.image])
         .filter(value => typeof value === 'string')
@@ -901,6 +1080,15 @@ app.patch('/api/admin/products/:id', authenticate, editorRoles, async (req, res)
     if (patch.status && !['Active', 'Draft', 'Out of Stock'].includes(patch.status)) return res.status(400).json({ success: false, error: 'Invalid product status.' });
     if (current.isSample && patch.status === 'Active') patch.isSample = false;
     const saved = await saveProduct({ ...current, ...patch }, Number(req.params.id));
+    if (notifyDraftSaved && saved.status === 'Draft') {
+      await notifyAdmins({
+        type: 'product_draft_saved',
+        title: 'Product draft saved',
+        message: `${saved.name} is saved in Product Studio for review.`,
+        page: 'admin-dropshipping',
+        params: { section: 'studio' },
+      }, ['super_admin', 'admin']);
+    }
     res.json({ success: true, data: saved });
   } catch (error) { res.status(500).json({ success: false, error: error.message }); }
 });
@@ -1053,6 +1241,7 @@ async function createOrder(req, res) {
   }
   try {
     const created = await createOrderRecord(req.body, {}, req.user?._id || req.user?.id);
+    await notifyOrderCreatedInApp(created);
     void notifyOrderCreated(created).catch(error => console.error('Could not prepare order notification:', error.message));
     res.status(201).json({ success: true, data: checkoutOrderSummary(created), paymentStatus: created.paymentStatus });
   } catch (error) {
@@ -1130,6 +1319,7 @@ app.post('/api/payments/paystack/initialize', paymentInitRateLimit, optionalAuth
     unpricedOrder.paymentAuthorizationUrl = parsedAuthorizationUrl.toString();
     unpricedOrder.paymentVerification = 'server_initialized';
     await saveOrder(unpricedOrder);
+    await notifyOrderCreatedInApp(unpricedOrder);
     void notifyOrderCreated(unpricedOrder).catch(error => console.error('Could not prepare order notification:', error.message));
     res.json({ success: true, data: checkoutOrderSummary(unpricedOrder), authorizationUrl: unpricedOrder.paymentAuthorizationUrl });
   } catch (error) {
@@ -1338,6 +1528,7 @@ app.use('/api/dropship', createDropshipRouter({
   findProduct,
   saveOrder,
   findOrder,
+  notifyAdmins,
 }));
 
 app.use((error, _req, res, _next) => {
